@@ -3429,6 +3429,10 @@ void setup() {
   BleScan::startBackgroundScanner();
   startStatusBarTask();
 
+  NeoFx::begin();
+  NeoFx::setEnabled(settings().neopixelEnabled);
+  if (settings().neopixelEnabled) NeoFx::event(NeoFx::Event::BootSplash);
+
   currentBatteryVoltage = readBatteryVoltage();
   displayMenu();
   drawStatusBar(currentBatteryVoltage, false);
@@ -3439,4 +3443,5 @@ void loop() {
   applyThemeToPalette(settings().theme);
   handleButtons();
   updateStatusBar();
+  NeoFx::tick();
 }

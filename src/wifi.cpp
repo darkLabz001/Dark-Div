@@ -6744,6 +6744,7 @@ void run() {
     return;
   }
   statusf("WiFi OK  %s", WiFi.localIP().toString().c_str());
+  TimeSync::tryNtp(3000);
 
   status("Fetching latest release...");
   WiFiClientSecure secure;
@@ -7082,9 +7083,11 @@ void run() {
   }
 
   OtaGithub::_saveCreds(ssid, pw);
+  bool ntpOk = TimeSync::tryNtp(4000);
   msgf(90, WS_GRN, "Connected  %s", WiFi.localIP().toString().c_str());
   msg(110, "Creds saved", WS_GRN);
-  msg(140, "Hold SELECT to exit");
+  msgf(125, ntpOk ? WS_GRN : WS_DIM, "NTP: %s", ntpOk ? "synced" : "skipped");
+  msg(160, "Hold SELECT to exit");
   while (!isButtonPressed(BTN_SELECT)) delay(50);
   drainSelect();
 }
@@ -7333,6 +7336,7 @@ static void pwnGpsDispatch(char* line) {
 
 static void pwnGpsFeed() {
   if (!gpsEnabled) return;
+  static bool prevFix = false;
   while (pwnGps.available()) {
     char c = (char)pwnGps.read();
     if (c == '\n') {
@@ -7347,6 +7351,10 @@ static void pwnGpsFeed() {
       gpsLineLen = 0;
     }
   }
+  if (!prevFix && gpsFixValid) {
+    NeoFx::event(NeoFx::Event::GpsFix);
+  }
+  prevFix = gpsFixValid;
 }
 
 static void pwnGpsBegin() {
@@ -7359,6 +7367,7 @@ static void pwnGpsBegin() {
   gpsFixQ = 0; gpsSatsUsed = 0;
   strncpy(gpsUtc,  "--:--:--", sizeof(gpsUtc));
   strncpy(gpsDate, "--/--/--", sizeof(gpsDate));
+  NeoFx::event(NeoFx::Event::GpsSearching);
 }
 
 static void pwnGpsEnd() {
@@ -7400,17 +7409,29 @@ static void appendCsvLine(const char* kind,
     safeSsid[j++] = c;
   }
 
+  // Prefer GPS time; fall back to NTP-synced system clock; finally to dashes.
+  char utcS[10], dateS[10];
+  if (gpsFixValid) {
+    strncpy(utcS,  gpsUtc,  sizeof(utcS));
+    strncpy(dateS, gpsDate, sizeof(dateS));
+  } else {
+    TimeSync::utcNow(utcS, sizeof(utcS));
+    TimeSync::utcDateNow(dateS, sizeof(dateS));
+  }
+
   if (gpsFixValid) {
     f.printf("%s,%s,%s,%s,%s,%u,%s,%.6f,%.6f,%u,%u\n",
-             kind, gpsUtc, gpsDate, bssidStr, safeSsid,
+             kind, utcS, dateS, bssidStr, safeSsid,
              (unsigned)ap.channel, staStr, gpsLat, gpsLon,
              (unsigned)gpsFixQ, (unsigned)gpsSatsUsed);
   } else {
     f.printf("%s,%s,%s,%s,%s,%u,%s,,,0,0\n",
-             kind, gpsUtc, gpsDate, bssidStr, safeSsid,
+             kind, utcS, dateS, bssidStr, safeSsid,
              (unsigned)ap.channel, staStr);
   }
   f.close();
+
+  NeoFx::event(NeoFx::Event::Capture);
 }
 
 // ── Face glyph strings (centered, monospace) ─────────────────────────────────
@@ -7702,6 +7723,8 @@ static void friendUpsert(const uint8_t* bssid, const char* name,
   friends[slot].lifetime   = lifetime;
   friends[slot].rssi       = rssi;
   friends[slot].lastSeenMs = now;
+  // New friend (not just a beacon refresh) → blue pulse.
+  NeoFx::event(NeoFx::Event::Friend);
 }
 
 static void friendsExpire() {
@@ -8132,11 +8155,14 @@ void pwnLoop() {
     friendsExpire();
   }
 
+  NeoFx::tick();
+
   // Auto-deauth.
   if (autoDeauth && bssidCount > 0 && (now - lastDeauthMs) >= PWN_DEAUTH_INTERVAL_MS) {
     lastDeauthMs = now;
     currentFace = Face::ANGRY;
     drawFace();
+    NeoFx::event(NeoFx::Event::Deauth);
     deauthOnCurrentChannel();
   }
 
@@ -8161,6 +8187,7 @@ void pwnLoop() {
   if (!pcf.digitalRead(BTN_RIGHT)) {
     currentFace = Face::ANGRY;
     drawFace();
+    NeoFx::event(NeoFx::Event::Deauth);
     deauthOnCurrentChannel();
     lastDeauthMs = now;
     delay(300);
@@ -8259,6 +8286,7 @@ async function status(){const j=await get('/api/info');if(!j){$('#main').textCon
   <b>PSRAM free</b><span>${fmtBytes(j.free_psram)}</span>
   <b>SD card</b><span>${j.sd_mounted?fmtBytes(j.sd_total)+' total':'NOT MOUNTED'}</span>
   <b>Battery</b><span>${j.battery_v.toFixed(2)} V</span>
+  <b>NTP</b><span>${j.ntp_set?'synced (UTC '+new Date(j.epoch*1000).toISOString().slice(11,19)+')':'not synced'}</span>
   <b>Requests served</b><span>${j.req_count}</span></div>`}
 async function pwn(){const j=await get('/api/pwn');if(!j){$('#main').textContent='no /pwn/state.json';return}
   $('#main').innerHTML=`<div class=face>( ^_^ )</div><div class=kv>
@@ -8325,6 +8353,8 @@ static void handleInfo() {
   out += "\"sd_mounted\":" + String(sdMounted ? "true" : "false") + ",";
   out += "\"sd_total\":"   + String(sdTot) + ",";
   out += "\"battery_v\":"  + String(readBatteryVoltage(), 2) + ",";
+  out += "\"ntp_set\":"    + String(TimeSync::isSet() ? "true" : "false") + ",";
+  out += "\"epoch\":"      + String(TimeSync::epoch()) + ",";
   out += "\"req_count\":"  + String(reqCount);
   out += "}";
 
@@ -8536,6 +8566,7 @@ void setup() {
     return;
   }
   wifiUp = true;
+  TimeSync::tryNtp(3000);
 
   dashServer.on("/",              handleRoot);
   dashServer.on("/api/info",      handleInfo);
@@ -8559,6 +8590,8 @@ void loop() {
     lastDrawMs = now;
     drawStatus();
   }
+
+  NeoFx::tick();
 
   if (isButtonPressed(BTN_SELECT)) {
     feature_exit_requested = true;

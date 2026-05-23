@@ -1684,6 +1684,7 @@ static bool applyNeoPixel(bool en){
   dirtySettings = true;
   uiDirty = true;
   lastChangeMs = millis();
+  NeoFx::setEnabled(en);
   return true;
 }
 

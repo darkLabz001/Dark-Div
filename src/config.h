@@ -162,6 +162,32 @@ namespace WebDashboard {
   void loop();
   void exit();
 }
+namespace TimeSync {
+  // Pull wall-clock time from NTP (UTC). Call after any successful WiFi
+  // connect — short timeout, safe to call repeatedly.
+  bool tryNtp(uint32_t timeoutMs = 4000);
+  bool isSet();
+  void utcNow(char* out, size_t cap);            // "HH:MM:SS"
+  void utcDateNow(char* out, size_t cap);        // "DD/MM/YY"
+  uint32_t epoch();                              // seconds since 1970, 0 if unset
+}
+namespace NeoFx {
+  // 4-LED WS2812 strip on GPIO 1. Driven by event() calls from features +
+  // a background tick() in the main loop. Honors settings.neopixelEnabled.
+  enum class Event : uint8_t {
+    Capture,        // green triple-flash (Pwn handshake/PMKID)
+    Deauth,         // red strobe (deauth burst)
+    Friend,         // blue pulse (Pwn friend detected)
+    GpsSearching,   // amber slow breath
+    GpsFix,         // white flash
+    BootSplash,     // red wave once on boot
+  };
+  void begin();
+  void tick();              // call from main loop
+  void event(Event e);
+  void setMoodBreath(uint32_t color);   // base color for idle breathing
+  void setEnabled(bool en);             // mirrors settings toggle, kills LEDs when off
+}
 namespace PwnMode {
   // Autonomous channel-hopping handshake hunter. Reuses HandshakeCapture's
   // EAPOL/PMKID parser but on every BSSID, not a single target, and walks
