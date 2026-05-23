@@ -1839,33 +1839,77 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 static int last_rendered_page = -1;
 static int last_rendered_index = -1;
 
+// Local scan-results cache.
+//
+// The Arduino String returned by WiFi.SSID(i) trips a heap_caps_free assert
+// on the ESP32-DIV V2 ("free() target pointer is outside heap areas") inside
+// the destructor — same crash on our build AND on upstream's official
+// precompiled v1.6.0 binary, so it isn't a build-config issue. To avoid the
+// crash entirely we run our own scan through the esp_wifi C APIs, copy the
+// records into a plain POD struct, and render from that. No Arduino String
+// destructor on the WiFi data path.
+struct ScanRec {
+  char     ssid[33];   // 32 chars + null
+  uint8_t  bssid[6];
+  int8_t   rssi;
+  uint8_t  channel;
+  uint8_t  auth;       // wifi_auth_mode_t cast
+};
+
+static ScanRec scanRecs[MAX_NETWORKS];
+static int     scanRecCount = 0;
+
+// Returns network count, or -1 on error.
+static int wifiScanMyself(bool passive = false, uint32_t ms_per_chan = 300) {
+  esp_wifi_scan_stop();  // safe even if no scan running
+
+  wifi_scan_config_t cfg = {};
+  cfg.show_hidden = true;
+  cfg.scan_type   = passive ? WIFI_SCAN_TYPE_PASSIVE : WIFI_SCAN_TYPE_ACTIVE;
+  if (passive) {
+    cfg.scan_time.passive = ms_per_chan;
+  } else {
+    cfg.scan_time.active.min = ms_per_chan / 4;
+    cfg.scan_time.active.max = ms_per_chan;
+  }
+
+  esp_err_t err = esp_wifi_scan_start(&cfg, true);  // blocking
+  if (err != ESP_OK) { scanRecCount = 0; return -1; }
+
+  uint16_t cnt = MAX_NETWORKS;
+  wifi_ap_record_t tmp[MAX_NETWORKS];
+  err = esp_wifi_scan_get_ap_records(&cnt, tmp);
+  if (err != ESP_OK) { scanRecCount = 0; return -1; }
+
+  if (cnt > MAX_NETWORKS) cnt = MAX_NETWORKS;
+  scanRecCount = (int)cnt;
+  for (int i = 0; i < scanRecCount; i++) {
+    memcpy(scanRecs[i].ssid, tmp[i].ssid, 32);
+    scanRecs[i].ssid[32] = '\0';
+    memcpy(scanRecs[i].bssid, tmp[i].bssid, 6);
+    scanRecs[i].rssi    = tmp[i].rssi;
+    scanRecs[i].channel = tmp[i].primary;
+    scanRecs[i].auth    = (uint8_t)tmp[i].authmode;
+  }
+  return scanRecCount;
+}
+
 static void drawNetworkRow(int i, int y, bool isSel) {
-  // Re-check bounds against the live scan count. The bg WiFi scan task can
-  // call WiFi.scanDelete() between displayWiFiList()'s count read and this
-  // row's WiFi.SSID(i) call (TOCTOU on feature_active). If the count dropped,
-  // bail rather than let the Arduino String destructor free() a bogus buffer
-  // pointer and trip "free() target pointer is outside heap areas".
-  const int liveCount = WiFi.scanComplete();
-  if (i < 0 || i >= liveCount) {
+  if (i < 0 || i >= scanRecCount) {
     tft.fillRect(0, y, SCREEN_WIDTH, LIST_ROW_H, TFT_BLACK);
     return;
   }
+  const ScanRec& r = scanRecs[i];
 
   char buf[64];
   char ssid[12];
-  // Copy the SSID into a local C buffer immediately; don't hold a String
-  // across the rest of the function so its destructor never runs on stale
-  // scan storage.
-  {
-    String fullSSID = WiFi.SSID(i);
-    strncpy(ssid, fullSSID.c_str(), 11);
-    ssid[11] = '\0';
-    if (fullSSID.length() > 11) strcat(ssid, "...");
-  }
+  strncpy(ssid, r.ssid, 11);
+  ssid[11] = '\0';
+  if (strlen(r.ssid) > 11) strcat(ssid, "...");
 
-  const int rssi = WiFi.RSSI(i);
-  const int ch = WiFi.channel(i);
-  const int auth = WiFi.encryptionType(i);
+  const int rssi = r.rssi;
+  const int ch   = r.channel;
+  const int auth = r.auth;
   const char* enc = (auth == WIFI_AUTH_OPEN) ? "OPEN" : "WPA2";
   snprintf(buf, sizeof(buf), "%02d: %-15s %3d dBm Ch%2d %s", i + 1, ssid, rssi, ch, enc);
 
@@ -1883,7 +1927,7 @@ static void drawNetworkRow(int i, int y, bool isSel) {
 
 void displayWiFiList(bool fullRedraw = false) {
   uiDrawn = false;
-  int networkCount = WiFi.scanComplete();
+  int networkCount = scanRecCount;
 
   if (fullRedraw) {
     tft.drawLine(0, 19, 240, 19, TFT_WHITE);
@@ -1983,7 +2027,9 @@ void startWiFiScan() {
   currentIndex = 0;
   listStartIndex = 0;
 
-  int numNetworks = WiFi.scanNetworks(false, true);
+  // Use our esp_wifi-based scan (populates scanRecs[]) — avoids the
+  // Arduino String destructor crash from WiFi.SSID(i).
+  int numNetworks = wifiScanMyself(false, 300);
 
   isScanning = false;
 
@@ -1999,7 +2045,8 @@ void displayWiFiDetails() {
   uiDrawn = false;
   tft.fillRect(0, 37, 240, 320, TFT_BLACK);
 
-  const int networkCount = WiFi.scanComplete();
+  // Read from our cache; Arduino's WiFi.SSID/BSSIDstr return crashing Strings.
+  const int networkCount = scanRecCount;
   if (networkCount <= 0) {
     isDetailView = false;
     displayWiFiList(true);
@@ -2008,27 +2055,31 @@ void displayWiFiDetails() {
   if (currentIndex < 0) currentIndex = 0;
   if (currentIndex >= networkCount) currentIndex = networkCount - 1;
 
-  String ssid = WiFi.SSID(currentIndex);
-  String bssid = WiFi.BSSIDstr(currentIndex);
-  int rssi = WiFi.RSSI(currentIndex);
-  int channel = WiFi.channel(currentIndex);
-  int encryption = WiFi.encryptionType(currentIndex);
-  bool isHidden = (ssid.length() == 0);
+  const ScanRec& r = scanRecs[currentIndex];
+  const int rssi = r.rssi;
+  const int channel = r.channel;
+  const int encryption = r.auth;
+  const bool isHidden = (r.ssid[0] == '\0');
   int y = 50;
 
   float signalQuality = constrain(2 * (rssi + 100), 0, 100);
   float estimatedDistance = pow(10.0, (-69.0 - rssi) / (10.0 * 2.0));
 
-  String encryptionType;
+  const char* encryptionType = "Unknown";
   switch (encryption) {
-    case WIFI_AUTH_OPEN: encryptionType = "Open"; break;
-    case WIFI_AUTH_WEP: encryptionType = "WEP"; break;
-    case WIFI_AUTH_WPA_PSK: encryptionType = "WPA"; break;
-    case WIFI_AUTH_WPA2_PSK: encryptionType = "WPA2"; break;
-    case WIFI_AUTH_WPA_WPA2_PSK: encryptionType = "WPA/WPA2"; break;
+    case WIFI_AUTH_OPEN:            encryptionType = "Open"; break;
+    case WIFI_AUTH_WEP:             encryptionType = "WEP"; break;
+    case WIFI_AUTH_WPA_PSK:         encryptionType = "WPA"; break;
+    case WIFI_AUTH_WPA2_PSK:        encryptionType = "WPA2"; break;
+    case WIFI_AUTH_WPA_WPA2_PSK:    encryptionType = "WPA/WPA2"; break;
     case WIFI_AUTH_WPA2_ENTERPRISE: encryptionType = "WPA2-Ent"; break;
-    default: encryptionType = "Unknown"; break;
+    case WIFI_AUTH_WPA3_PSK:        encryptionType = "WPA3"; break;
+    case WIFI_AUTH_WPA2_WPA3_PSK:   encryptionType = "WPA2/WPA3"; break;
   }
+
+  char bssidStr[18];
+  snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           r.bssid[0], r.bssid[1], r.bssid[2], r.bssid[3], r.bssid[4], r.bssid[5]);
 
   // NOTE: In this file TFT_WHITE is remapped to FEATURE_TEXT (orange).
   // Use real WHITE for normal detail text.
@@ -2036,11 +2087,11 @@ void displayWiFiDetails() {
   tft.setTextSize(1);
 
   tft.setCursor(10, y);
-  tft.print("SSID: "); tft.print(isHidden ? "(Hidden)" : ssid);
+  tft.print("SSID: "); tft.print(isHidden ? "(Hidden)" : r.ssid);
   y += 20;
 
   tft.setCursor(10, y);
-  tft.print("BSSID: "); tft.print(bssid);
+  tft.print("BSSID: "); tft.print(bssidStr);
   y += 20;
 
   tft.setCursor(10, y);
@@ -2083,7 +2134,7 @@ void handleButton() {
   }
 
   if (!pcf.digitalRead(BTN_DOWN)) {
-    if (!isDetailView && currentIndex < WiFi.scanComplete() - 1) {
+    if (!isDetailView && currentIndex < scanRecCount - 1) {
       currentIndex++;
       delay(200);
       current_page = currentIndex / max(1, NETWORKS_PER_PAGE);
