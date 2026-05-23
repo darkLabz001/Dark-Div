@@ -2989,7 +2989,7 @@ void handleAboutPage() {
   tft.setTextSize(1);
   tft.setTextFont(2);
 
-  const char* title = "[About This Project]";
+  const char* title = "[ DARK-DIV ]";
   tft.setCursor(10, 50);
   tft.println(title);
 
@@ -2998,27 +2998,26 @@ void handleAboutPage() {
   int text_y = 80;
   tft.setCursor(text_x, text_y);
   tft.print("- ");
-  tftPrintlnObf(OBF_PN, sizeof(OBF_PN));
+  tft.println(ESP32DIV_NAME);
   text_y += lineHeight;
   tft.setCursor(text_x, text_y);
-  tft.print("- Developed by: ");
-  tftPrintlnObf(OBF_DN, sizeof(OBF_DN));
+  tft.print("- Edition: ARASAKA");
   text_y += lineHeight;
   tft.setCursor(text_x, text_y);
   tft.print("- Version: ");
   tft.println(ESP32DIV_VERSION);
   text_y += lineHeight;
   tft.setCursor(text_x, text_y);
-  tft.print("- Contact: ");
-  tftPrintlnObf(OBF_EM, sizeof(OBF_EM));
+  tft.print("- Fork of: ESP32-DIV");
   text_y += lineHeight;
   tft.setCursor(text_x, text_y);
-  tft.print("- GitHub: ");
-  tftPrintlnObf(OBF_GH, sizeof(OBF_GH));
+  tft.print("- Upstream: github.com/cifertech");
   text_y += lineHeight;
   tft.setCursor(text_x, text_y);
-  tft.print("- Website: ");
-  tftPrintlnObf(OBF_WB, sizeof(OBF_WB));
+  tft.print("- License: MIT");
+  text_y += lineHeight;
+  tft.setCursor(text_x, text_y);
+  tft.print("- Repo: github.com/darkLabz001/Dark-Div");
 
   tft.setTextFont(1);
   tft.setCursor(10, 300);
@@ -3261,7 +3260,9 @@ void setup() {
 
   tft.fillScreen(TFT_BLACK);
 
-  displayLogo(TFT_WHITE, 500);
+  // Color arg is ignored by the Dark-Div Arasaka splash — it drives its own
+  // red palette. 1500 ms gives the loading bar room to animate.
+  displayLogo(TFT_WHITE, 1500);
 
   settingsLoad();
   applyThemeToPalette(settings().theme);

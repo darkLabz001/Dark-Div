@@ -2373,8 +2373,8 @@ void wifiscanLoop() {
 
 namespace CaptivePortal {
 
-const char* default_ssid = "ESP32DIV_AP";
-char custom_ssid[32] = "ESP32DIV_AP";
+const char* default_ssid = "DARK-DIV_AP";
+char custom_ssid[32] = "DARK-DIV_AP";
 const char* password = NULL;
 
 static uint8_t ap_channel = 1;
@@ -2441,7 +2441,7 @@ const char* keyboardLayout[] = {
 bool cursorState = false;
 unsigned long lastCursorToggle = 0;
 
-const char* seriesSSIDs[] = {"ESP32DIV_AP", "FreeWiFi", "Loading..."};
+const char* seriesSSIDs[] = {"DARK-DIV_AP", "FreeWiFi", "Loading..."};
 const int numSeriesSSIDs = 3;
 int seriesSSIDIndex = 0;
 
@@ -4117,8 +4117,8 @@ void deautherLoop() {
             if (new_channel != selectedChannel) {
                 selectedChannel = new_channel;
                 wifi_config_t ap_config = {0};
-                strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
-                ap_config.ap.ssid_len = strlen("ESP32-DIV");
+                strncpy((char*)ap_config.ap.ssid, "DARK-DIV", sizeof(ap_config.ap.ssid));
+                ap_config.ap.ssid_len = strlen("DARK-DIV");
                 strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
                 ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
                 ap_config.ap.ssid_hidden = 0;
@@ -4738,8 +4738,8 @@ void probeRequestFloodLoop() {
             if (new_channel != selectedChannel) {
                 selectedChannel = new_channel;
                 wifi_config_t ap_config = {0};
-                strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
-                ap_config.ap.ssid_len = strlen("ESP32-DIV");
+                strncpy((char*)ap_config.ap.ssid, "DARK-DIV", sizeof(ap_config.ap.ssid));
+                ap_config.ap.ssid_len = strlen("DARK-DIV");
                 strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
                 ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
                 ap_config.ap.ssid_hidden = 0;

@@ -65,11 +65,14 @@ const uint16_t ORANGE = 0xFBE4, GRAY = 0x8410, BLUE = 0x001F, RED = 0xF800,
 #endif
 
 /*──────────────────── Project Info ────────────────────*/
+// Dark-Div is a hard fork of cifertech/ESP32-DIV. The ESP32DIV_* macro
+// names are kept so existing call sites (BLE device name, OBF helpers,
+// version refs) link cleanly without sprawl through every translation unit.
 #ifndef ESP32DIV_NAME
-#define ESP32DIV_NAME "ESP32-DIV"
+#define ESP32DIV_NAME "DARK-DIV"
 #endif
 #ifndef ESP32DIV_VERSION
-#define ESP32DIV_VERSION "v1.6.0"
+#define ESP32DIV_VERSION "v1.7.0-darkdiv"
 #endif
 
 

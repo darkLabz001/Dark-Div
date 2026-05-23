@@ -922,49 +922,123 @@ void loading(int frameDelay, uint16_t color, int16_t x, int16_t y, int repeats, 
 }
 
 void displayLogo(uint16_t color, int displayTime) {
-  int16_t bitmapWidth = 150;
-  int16_t bitmapHeight = 150;
-  int16_t screenWidth = tft.width();
-  int16_t screenHeight = tft.height();
-  int16_t logoX = (screenWidth - bitmapWidth) / 2;
-  int16_t logoY = (screenHeight - bitmapHeight) / 2 - 20;
+  // Dark-Div boot splash — Arasaka corporate aesthetic.
+  // Red on pure black, sharp angular geometry, corp-style HUD lines.
+  // The `color` param from upstream callers is ignored; we drive our own palette.
+  (void)color;
 
-  tft.fillRect(logoX, logoY, bitmapWidth, bitmapHeight, TFT_BLACK);
-  tft.drawBitmap(logoX, logoY, bitmap_icon_cifer, bitmapWidth, bitmapHeight, color);
+  const uint16_t ARA_RED   = tft.color565(200,  20,  30);   // bright arasaka red
+  const uint16_t ARA_DARK  = tft.color565( 90,   0,  10);   // dim accent
+  const uint16_t ARA_DEEP  = tft.color565( 40,   0,   5);   // shadow
 
-  tft.setTextColor(color);
-  tft.setTextFont(1);
+  const int W = tft.width();
+  const int H = tft.height();
 
+  tft.fillScreen(TFT_BLACK);
+
+  /* ── HUD frame: corner brackets + accent bars ─────────────── */
+  // Top bar
+  tft.fillRect(0, 0, W, 3, ARA_RED);
+  tft.drawFastHLine(0, 5, W, ARA_DARK);
+  // Bottom bar
+  tft.fillRect(0, H - 3, W, 3, ARA_RED);
+  tft.drawFastHLine(0, H - 6, W, ARA_DARK);
+  // Corner brackets (TL, TR, BL, BR)
+  const int B = 12;
+  tft.fillRect(0,      8, B, 2, ARA_RED);
+  tft.fillRect(0,      8, 2, B, ARA_RED);
+  tft.fillRect(W - B,  8, B, 2, ARA_RED);
+  tft.fillRect(W - 2,  8, 2, B, ARA_RED);
+  tft.fillRect(0,      H - 10 - B, 2, B, ARA_RED);
+  tft.fillRect(0,      H - 10,     B, 2, ARA_RED);
+  tft.fillRect(W - 2,  H - 10 - B, 2, B, ARA_RED);
+  tft.fillRect(W - B,  H - 10,     B, 2, ARA_RED);
+
+  /* ── Central diamond logo (Arasaka-ish geometric mark) ────── */
+  const int cx  = W / 2;
+  const int cy  = H / 2 - 30;
+  const int rad = 42;
+  // Outer diamond, double-stroked for weight
+  for (int o = 0; o < 2; o++) {
+    tft.drawLine(cx,       cy - rad + o, cx + rad - o, cy,           ARA_RED);
+    tft.drawLine(cx + rad - o, cy,       cx,           cy + rad - o, ARA_RED);
+    tft.drawLine(cx,       cy + rad - o, cx - rad + o, cy,           ARA_RED);
+    tft.drawLine(cx - rad + o, cy,       cx,           cy - rad + o, ARA_RED);
+  }
+  // Inner cross (like the strokes of a katakana glyph)
+  tft.fillRect(cx - 1, cy - rad + 10, 3, (rad * 2) - 20, ARA_RED);
+  tft.fillRect(cx - rad + 10, cy - 1, (rad * 2) - 20, 3, ARA_RED);
+  // Inner dim diamond ring
+  for (int o = 8; o < 10; o++) {
+    tft.drawLine(cx,           cy - rad + o, cx + rad - o, cy,           ARA_DEEP);
+    tft.drawLine(cx + rad - o, cy,           cx,           cy + rad - o, ARA_DEEP);
+    tft.drawLine(cx,           cy + rad - o, cx - rad + o, cy,           ARA_DEEP);
+    tft.drawLine(cx - rad + o, cy,           cx,           cy - rad + o, ARA_DEEP);
+  }
+
+  /* ── Title block ──────────────────────────────────────────── */
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setTextFont(2);
   tft.setTextSize(2);
-  int16_t textX = screenWidth / 3.5;
-  int16_t textY = logoY + bitmapHeight + 10;
-  tft.setCursor(textX, textY);
-  tftPrintObf(OBF_PN, sizeof(OBF_PN));
+  {
+    const char* t = "DARK-DIV";
+    int tw = tft.textWidth(t);
+    tft.setCursor((W - tw) / 2, cy + rad + 18);
+    tft.print(t);
+  }
 
+  // Subtitle line — corporate division marker
   tft.setTextSize(1);
-  textX = screenWidth / 3.5;
-  textY += 20;
-  tft.setCursor(textX, textY);
-  tft.print("by ");
-  tftPrintObf(OBF_DN, sizeof(OBF_DN));
+  tft.setTextFont(2);
+  tft.setTextColor(ARA_DARK, TFT_BLACK);
+  {
+    const char* s = "ARASAKA  DIVISION";
+    int sw = tft.textWidth(s);
+    tft.setCursor((W - sw) / 2, cy + rad + 50);
+    tft.print(s);
+  }
 
-  textX = screenWidth / 2.5;
-  textY += 50;
-  tft.setCursor(textX, textY);
-  // Version is intentionally NOT obfuscated.
-  tft.print(ESP32DIV_VERSION);
+  // Version + build line
+  tft.setTextFont(1);
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  {
+    char vbuf[40];
+    snprintf(vbuf, sizeof(vbuf), "SYS %s  /  SECURE BOOT", ESP32DIV_VERSION);
+    int vw = strlen(vbuf) * 6;
+    tft.setCursor((W - vw) / 2, cy + rad + 72);
+    tft.print(vbuf);
+  }
 
-  Serial.println("==================================");
-  serialPrintObf(OBF_PN, sizeof(OBF_PN), true);
-  Serial.print("Developed by: "); serialPrintObf(OBF_DN, sizeof(OBF_DN), true);
-  // Version is intentionally NOT obfuscated.
-  Serial.print("Version:      "); Serial.println(ESP32DIV_VERSION);
-  Serial.print("Contact:      "); serialPrintObf(OBF_EM, sizeof(OBF_EM), true);
-  Serial.print("GitHub:       "); serialPrintObf(OBF_GH, sizeof(OBF_GH), true);
-  Serial.print("Website:      "); serialPrintObf(OBF_WB, sizeof(OBF_WB), true);
-  Serial.println("==================================");
+  /* ── Loading bar ──────────────────────────────────────────── */
+  const int barX  = 20;
+  const int barY  = H - 28;
+  const int barW  = W - 40;
+  const int barH  = 6;
+  tft.drawRect(barX - 1, barY - 1, barW + 2, barH + 2, ARA_RED);
+  tft.setTextFont(1);
+  tft.setTextColor(ARA_DARK, TFT_BLACK);
+  tft.setCursor(barX, barY - 12);
+  tft.print("> INIT");
+  tft.setCursor(barX + barW - 18, barY - 12);
+  tft.print("OK");
 
-  delay(displayTime);
+  // Animate fill in proportion to displayTime
+  const int steps = barW;
+  const int stepDelay = (displayTime > 0) ? max(1, displayTime / steps) : 1;
+  for (int x = 0; x < steps; x++) {
+    tft.drawFastVLine(barX + x, barY, barH, ARA_RED);
+    if (stepDelay > 0) delay(stepDelay);
+  }
+
+  /* ── Serial banner ────────────────────────────────────────── */
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println("  DARK-DIV  //  ARASAKA  DIVISION");
+  Serial.print  ("  SYS ");  Serial.print(ESP32DIV_VERSION);
+  Serial.println("   //   SECURE BOOT  OK");
+  Serial.println("  Fork of cifertech/ESP32-DIV (MIT)");
+  Serial.println("  github.com/darkLabz001/Dark-Div");
+  Serial.println("================================================");
 }
 
 namespace Terminal {
