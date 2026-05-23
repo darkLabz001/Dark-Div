@@ -147,6 +147,13 @@ namespace OtaGithub {
   // on-screen keyboard the first time it's invoked; persists them in NVS.
   void run();
 }
+namespace WifiSetup {
+  // Interactive WiFi scan + connect flow. Lists nearby SSIDs, lets the user
+  // pick one (UP/DOWN to navigate, RIGHT or touch to select), prompts for
+  // the password via the on-screen keyboard, stores credentials in NVS, and
+  // attempts a connection. Credentials are shared with OtaGithub::run().
+  void run();
+}
 namespace PwnMode {
   // Autonomous channel-hopping handshake hunter. Reuses HandshakeCapture's
   // EAPOL/PMKID parser but on every BSSID, not a single target, and walks

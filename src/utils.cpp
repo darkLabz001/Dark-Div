@@ -1284,9 +1284,10 @@ static int  sel = 0;
 static bool dirtySettings = false;
 static bool uiDirty = false;
 
-static const char* items[] = {"Brightness", "Theme", "NeoPixel", "Auto Scan", "OTA Update"};
+static const char* items[] = {"Brightness", "Theme", "NeoPixel", "Auto Scan", "WiFi", "OTA Update"};
 static const int N = sizeof(items)/sizeof(items[0]);
-static const int OTA_ROW = 4;
+static const int WIFI_ROW = 4;
+static const int OTA_ROW  = 5;
 
 static uint8_t  last_brightness;
 static Theme    last_theme;
@@ -1556,6 +1557,19 @@ static void drawAll() {
   bool autoScan = (s.autoWifiScan || s.autoBleScan);
   drawAutoScan(autoScan, sel==3);
 
+  // WiFi row — action row.
+  {
+    drawCardStatic(WIFI_ROW, sel==WIFI_ROW);
+    Rect r = rowRect(WIFI_ROW);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(sel==WIFI_ROW ? UI.accent : textDim, UI_BG);
+    const char* hint = "[SCAN >]";
+    int hw = tft.textWidth(hint);
+    tft.setCursor(r.x + r.w - hw - 6, r.y + (r.h/2 - 6));
+    tft.print(hint);
+  }
+
   // OTA row — action row, no toggle/widget. Just the label + "[RUN]" hint.
   {
     drawCardStatic(OTA_ROW, sel==OTA_ROW);
@@ -1595,6 +1609,17 @@ static void redrawIfChanged() {
     drawCardStatic(2, sel==2);  drawSwitchWidgetRow(s.neopixelEnabled, sel==2, 2);
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
     drawCardStatic(3, sel==3);  drawSwitchWidgetRow(autoScan, sel==3, 3);
+    {
+      drawCardStatic(WIFI_ROW, sel==WIFI_ROW);
+      Rect rw = rowRect(WIFI_ROW);
+      tft.setTextFont(2);
+      tft.setTextSize(1);
+      tft.setTextColor(sel==WIFI_ROW ? UI.accent : textDim, UI_BG);
+      const char* hw_lbl = "[SCAN >]";
+      int hww = tft.textWidth(hw_lbl);
+      tft.setCursor(rw.x + rw.w - hww - 6, rw.y + (rw.h/2 - 6));
+      tft.print(hw_lbl);
+    }
     {
       drawCardStatic(OTA_ROW, sel==OTA_ROW);
       Rect r = rowRect(OTA_ROW);
@@ -1759,6 +1784,20 @@ static void handleTouch() {
         lastToggleMs = now;
       }
     }
+  } else if (sel == WIFI_ROW) {
+    // Tap anywhere on the WiFi card triggers the scan/connect flow.
+    Rect r = rowRect(WIFI_ROW);
+    if (touchInRect(r, tx, ty)) {
+      WifiSetup::run();
+      drawAll();
+    }
+  } else if (sel == OTA_ROW) {
+    // Tap anywhere on the OTA card triggers the update flow.
+    Rect r = rowRect(OTA_ROW);
+    if (touchInRect(r, tx, ty)) {
+      OtaGithub::run();
+      drawAll();
+    }
   }
 }
 
@@ -1822,6 +1861,10 @@ void loop(){
     else if (sel==1)                   { applyTheme(Theme::Light); }
     else if (sel==2)                   { applyNeoPixel(true); }
     else if (sel==3)                   { applyAutoScan(true); }
+    else if (sel==WIFI_ROW)            {
+      WifiSetup::run();
+      drawAll();
+    }
     else if (sel==OTA_ROW)             {
       // Action row — RIGHT triggers the OTA flow. It takes over the screen,
       // runs to completion (reboot on success, return on failure), and we

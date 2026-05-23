@@ -6495,7 +6495,8 @@ static void statusf(const char* fmt, ...) {
   status(buf);
 }
 
-// ── NVS-backed Wi-Fi creds ──────────────────────────────────────────────────
+// ── NVS-backed Wi-Fi creds (shared with WifiSetup) ──────────────────────────
+// PREF_NS is kept as "ota" for backwards compat with existing installs.
 static bool loadCreds(String& ssid, String& pw) {
   Preferences p;
   if (!p.begin(PREF_NS, true)) return false;
@@ -6512,6 +6513,10 @@ static void saveCreds(const String& ssid, const String& pw) {
   p.putString("pw",   pw);
   p.end();
 }
+
+// Exposed to WifiSetup below.
+bool _loadCreds(String& ssid, String& pw) { return loadCreds(ssid, pw); }
+void _saveCreds(const String& ssid, const String& pw) { saveCreds(ssid, pw); }
 
 // ── Keyboard prompts ────────────────────────────────────────────────────────
 static const char* kbdRowsUpper[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
@@ -6710,6 +6715,214 @@ void run() {
 }
 
 }  // namespace OtaGithub
+
+/* ════════════════════════════════════════════════════════════════════════════
+   WifiSetup — interactive scan + connect, persists creds for OtaGithub.
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace OtaGithub {
+  bool _loadCreds(String& ssid, String& pw);
+  void _saveCreds(const String& ssid, const String& pw);
+}
+
+namespace WifiSetup {
+
+static const uint16_t WS_RED  = 0xE0E6;
+static const uint16_t WS_DIM  = 0x6020;
+static const uint16_t WS_GRN  = 0x07C0;
+
+static void shell(const char* title) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(2);
+  tft.setTextColor(WS_RED, TFT_BLACK);
+  tft.setCursor(20, 14);
+  tft.print(title);
+  tft.drawFastHLine(10, 40, 220, WS_RED);
+  tft.setTextSize(1);
+}
+
+static void msg(int y, const char* s, uint16_t color = 0) {
+  if (color == 0) color = WS_RED;
+  tft.fillRect(0, y, 240, 16, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setCursor(10, y);
+  tft.print(s);
+}
+
+static void msgf(int y, uint16_t color, const char* fmt, ...) {
+  char buf[80];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  msg(y, buf, color);
+}
+
+static bool promptText(const char* t1, const char* t2, String& out, bool isPw) {
+  OnScreenKeyboardConfig cfg = {};
+  cfg.titleLine1     = t1;
+  cfg.titleLine2     = t2;
+  static const char* up[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+  static const char* lo[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+  static const char* sh[] = {"UPPER", "lower"};
+  cfg.rows           = up;
+  cfg.rowCount       = 4;
+  cfg.maxLen         = 63;
+  cfg.shuffleNames   = sh;
+  cfg.shuffleCount   = 2;
+  cfg.buttonsY       = 280;
+  cfg.backLabel      = "Back";
+  cfg.middleLabel    = "Case";
+  cfg.okLabel        = "OK";
+  cfg.enableShuffle  = true;
+  cfg.requireNonEmpty = !isPw;
+  cfg.emptyErrorMsg  = "Cannot be empty";
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, out);
+  if (r.accepted) { out = r.text; return true; }
+  return false;
+}
+
+static const char* authShort(wifi_auth_mode_t a) {
+  switch (a) {
+    case WIFI_AUTH_OPEN:           return "open";
+    case WIFI_AUTH_WEP:            return "WEP";
+    case WIFI_AUTH_WPA_PSK:        return "WPA";
+    case WIFI_AUTH_WPA2_PSK:       return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:   return "WPA/2";
+    case WIFI_AUTH_WPA3_PSK:       return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:  return "WPA2/3";
+    default:                       return "?";
+  }
+}
+
+// Draw the scan list. Highlights `sel` (0-based into networks[0..n-1]).
+static void drawList(int n, int sel, int scroll, int maxRows) {
+  tft.fillRect(0, 50, 240, 240, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  for (int row = 0; row < maxRows && (scroll + row) < n; row++) {
+    int i = scroll + row;
+    int y = 54 + row * 18;
+    bool active = (i == sel);
+    if (active) {
+      tft.fillRect(4, y - 2, 232, 17, WS_DIM);
+    }
+    int rssi = WiFi.RSSI(i);
+    char line[42];
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) ssid = "<hidden>";
+    if (ssid.length() > 18) ssid = ssid.substring(0, 18);
+    snprintf(line, sizeof(line), "%-18s %4d %s",
+             ssid.c_str(), rssi, authShort(WiFi.encryptionType(i)));
+    tft.setTextColor(active ? WHITE : WS_RED, active ? WS_DIM : TFT_BLACK);
+    tft.setCursor(8, y);
+    tft.print(line);
+  }
+  // Footer hint
+  tft.setTextColor(WS_DIM, TFT_BLACK);
+  tft.setCursor(8, 300);
+  tft.print("UP/DOWN  RIGHT=pick  SEL=back");
+}
+
+void run() {
+  shell("[ WIFI SETUP ]");
+  msg(50, "Scanning...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  delay(50);
+
+  int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+  if (n <= 0) {
+    msg(50, "No networks found", TFT_RED);
+    msg(70, "Hold SELECT to exit");
+    while (!isButtonPressed(BTN_SELECT)) delay(50);
+    while (isButtonPressed(BTN_SELECT)) delay(20);
+    return;
+  }
+
+  shell("[ WIFI SETUP ]");
+  int sel = 0;
+  const int maxRows = 12;
+  int scroll = 0;
+  drawList(n, sel, scroll, maxRows);
+
+  bool upPrev = false, downPrev = false, rightPrev = false, selPrev = false;
+  for (;;) {
+    bool up    = isButtonPressed(BTN_UP);
+    bool down  = isButtonPressed(BTN_DOWN);
+    bool right = isButtonPressed(BTN_RIGHT);
+    bool selB  = isButtonPressed(BTN_SELECT);
+
+    if (selB && !selPrev) {
+      WiFi.scanDelete();
+      return;
+    }
+    if (up && !upPrev) {
+      if (sel > 0) sel--;
+      if (sel < scroll) scroll = sel;
+      drawList(n, sel, scroll, maxRows);
+    }
+    if (down && !downPrev) {
+      if (sel < n - 1) sel++;
+      if (sel >= scroll + maxRows) scroll = sel - maxRows + 1;
+      drawList(n, sel, scroll, maxRows);
+    }
+    if (right && !rightPrev) {
+      break;
+    }
+    upPrev = up; downPrev = down; rightPrev = right; selPrev = selB;
+    delay(30);
+  }
+
+  String ssid = WiFi.SSID(sel);
+  wifi_auth_mode_t auth = WiFi.encryptionType(sel);
+  WiFi.scanDelete();
+
+  if (ssid.length() == 0) {
+    shell("[ WIFI SETUP ]");
+    msg(50, "Hidden SSID — type it");
+    delay(800);
+    if (!promptText("Hidden SSID", "Type the network name", ssid, false)) return;
+  }
+
+  String pw = "";
+  if (auth != WIFI_AUTH_OPEN) {
+    shell("[ WIFI SETUP ]");
+    msgf(50, WS_RED, "SSID: %s", ssid.c_str());
+    msg(70, "Enter password...");
+    delay(500);
+    if (!promptText("WiFi Password", ssid.c_str(), pw, true)) return;
+  }
+
+  shell("[ WIFI SETUP ]");
+  msgf(50, WS_RED, "Connecting to %s", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  WiFi.begin(ssid.c_str(), pw.c_str());
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) {
+    delay(250);
+    msgf(70, WS_DIM, "  state=%d  %lus", (int)WiFi.status(), (unsigned long)((millis() - t0) / 1000));
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    msg(90, "Failed (timeout)", TFT_RED);
+    msg(110, "Hold SELECT to exit");
+    while (!isButtonPressed(BTN_SELECT)) delay(50);
+    while (isButtonPressed(BTN_SELECT)) delay(20);
+    return;
+  }
+
+  OtaGithub::_saveCreds(ssid, pw);
+  msgf(90, WS_GRN, "Connected  %s", WiFi.localIP().toString().c_str());
+  msg(110, "Creds saved", WS_GRN);
+  msg(140, "Hold SELECT to exit");
+  while (!isButtonPressed(BTN_SELECT)) delay(50);
+  while (isButtonPressed(BTN_SELECT)) delay(20);
+}
+
+}  // namespace WifiSetup
 
 /* ════════════════════════════════════════════════════════════════════════════
    PwnMode — Pwnagotchi-style autonomous handshake hunter.
