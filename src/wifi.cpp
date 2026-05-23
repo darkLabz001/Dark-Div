@@ -1738,9 +1738,7 @@ static void bgWifiScanTask(void* ) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
         WiFi.scanDelete();
-        // async, show_hidden, passive, 320 ms/channel — passive listens for beacons so we catch
-        // APs that ignore probe requests (consumer routers in power-save, etc).
-        int ret = WiFi.scanNetworks(true, true, true, 320);
+        int ret = WiFi.scanNetworks(true, true);
 
         bgScanRunning = (ret == WIFI_SCAN_RUNNING);
         if (ret >= 0) {
@@ -1841,20 +1839,6 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 static int last_rendered_page = -1;
 static int last_rendered_index = -1;
 
-static const char* encLabel(int auth) {
-  switch (auth) {
-    case WIFI_AUTH_OPEN:            return "OPEN";
-    case WIFI_AUTH_WEP:             return "WEP";
-    case WIFI_AUTH_WPA_PSK:         return "WPA";
-    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
-    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA12";
-    case WIFI_AUTH_WPA2_ENTERPRISE: return "EAP";
-    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
-    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA23";
-    default:                        return "?";
-  }
-}
-
 static void drawNetworkRow(int i, int y, bool isSel) {
   char buf[64];
   char ssid[12];
@@ -1866,7 +1850,7 @@ static void drawNetworkRow(int i, int y, bool isSel) {
   const int rssi = WiFi.RSSI(i);
   const int ch = WiFi.channel(i);
   const int auth = WiFi.encryptionType(i);
-  const char* enc = encLabel(auth);
+  const char* enc = (auth == WIFI_AUTH_OPEN) ? "OPEN" : "WPA2";
   snprintf(buf, sizeof(buf), "%02d: %-15s %3d dBm Ch%2d %s", i + 1, ssid, rssi, ch, enc);
 
   // Clear only this row (avoid overlapping next row).
@@ -1983,8 +1967,7 @@ void startWiFiScan() {
   currentIndex = 0;
   listStartIndex = 0;
 
-  // sync, show_hidden, passive, 320 ms/channel — same rationale as the bg scanner.
-  int numNetworks = WiFi.scanNetworks(false, true, true, 320);
+  int numNetworks = WiFi.scanNetworks(false, true);
 
   isScanning = false;
 
