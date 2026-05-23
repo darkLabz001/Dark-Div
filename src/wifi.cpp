@@ -1859,39 +1859,48 @@ struct ScanRec {
 static ScanRec scanRecs[MAX_NETWORKS];
 static int     scanRecCount = 0;
 
+// Static scratch String reused across calls — never goes out of scope, so its
+// destructor (the crash site) never runs. Pre-reserved to 34 bytes so
+// getNetworkInfo()'s "ssid = (const char*)it->ssid" assignment never
+// reallocates (no realloc → no free → no chance to hit the bad pointer).
+static String g_ssidScratch;
+
 // Returns network count, or -1 on error.
+//
+// We use Arduino's WiFi.scanNetworks() because the direct esp_wifi_scan_start
+// path returns 0 APs in this firmware (some interaction with how arduino-esp32
+// initialises the radio that we don't unwind). For data extraction we avoid
+// WiFi.SSID(i)'s temporary String (the original crash) and use getNetworkInfo()
+// writing into g_ssidScratch.
 static int wifiScanMyself(bool passive = false, uint32_t ms_per_chan = 300) {
-  esp_wifi_scan_stop();  // safe even if no scan running
+  g_ssidScratch.reserve(34);
 
-  wifi_scan_config_t cfg = {};
-  cfg.show_hidden = true;
-  cfg.scan_type   = passive ? WIFI_SCAN_TYPE_PASSIVE : WIFI_SCAN_TYPE_ACTIVE;
-  if (passive) {
-    cfg.scan_time.passive = ms_per_chan;
-  } else {
-    cfg.scan_time.active.min = ms_per_chan / 4;
-    cfg.scan_time.active.max = ms_per_chan;
-  }
+  int n = WiFi.scanNetworks(false /*async*/, true /*hidden*/,
+                            passive, ms_per_chan);
+  if (n < 0) { scanRecCount = 0; return -1; }
+  if (n > MAX_NETWORKS) n = MAX_NETWORKS;
+  scanRecCount = n;
 
-  esp_err_t err = esp_wifi_scan_start(&cfg, true);  // blocking
-  if (err != ESP_OK) { scanRecCount = 0; return -1; }
-
-  uint16_t cnt = MAX_NETWORKS;
-  wifi_ap_record_t tmp[MAX_NETWORKS];
-  err = esp_wifi_scan_get_ap_records(&cnt, tmp);
-  if (err != ESP_OK) { scanRecCount = 0; return -1; }
-
-  if (cnt > MAX_NETWORKS) cnt = MAX_NETWORKS;
-  scanRecCount = (int)cnt;
-  for (int i = 0; i < scanRecCount; i++) {
-    memcpy(scanRecs[i].ssid, tmp[i].ssid, 32);
+  for (int i = 0; i < n; i++) {
+    uint8_t enc = 0;
+    int32_t rssi = 0;
+    uint8_t* bssid = nullptr;
+    int32_t ch = 0;
+    g_ssidScratch = "";
+    bool ok = WiFi.getNetworkInfo((uint8_t)i, g_ssidScratch, enc, rssi, bssid, ch);
+    if (ok) {
+      strncpy(scanRecs[i].ssid, g_ssidScratch.c_str(), 32);
+    } else {
+      scanRecs[i].ssid[0] = '\0';
+    }
     scanRecs[i].ssid[32] = '\0';
-    memcpy(scanRecs[i].bssid, tmp[i].bssid, 6);
-    scanRecs[i].rssi    = tmp[i].rssi;
-    scanRecs[i].channel = tmp[i].primary;
-    scanRecs[i].auth    = (uint8_t)tmp[i].authmode;
+    if (bssid) memcpy(scanRecs[i].bssid, bssid, 6);
+    else       memset(scanRecs[i].bssid, 0, 6);
+    scanRecs[i].rssi    = (int8_t)rssi;
+    scanRecs[i].channel = (uint8_t)ch;
+    scanRecs[i].auth    = enc;
   }
-  return scanRecCount;
+  return n;
 }
 
 static void drawNetworkRow(int i, int y, bool isSel) {
