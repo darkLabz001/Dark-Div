@@ -2,6 +2,7 @@
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"
+#include "gps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -6772,6 +6773,266 @@ static Face     lastDrawnFace    = (Face)(-1);
 static bool     sdReady          = false;
 static bool     autoDeauth       = true;
 
+// ── Persistent personality (SD /pwn/state.json) ──────────────────────────────
+static constexpr const char* PWN_DIR        = "/pwn";
+static constexpr const char* PWN_STATE_PATH = "/pwn/state.json";
+static constexpr uint32_t    PWN_SAVE_MIN_MS = 5000;    // capture-driven debounce
+static constexpr uint32_t    PWN_SAVE_HEARTBEAT_MS = 30000;
+
+struct Persist {
+  char     name[17];        // up to 16 chars + NUL
+  uint32_t totalHandshakes;
+  uint32_t totalPmkids;
+  uint32_t totalUptimeS;    // cumulative across reboots
+  uint32_t sessions;
+  uint16_t bestSession;     // best (PMKID+handshake) count in a single session
+};
+static Persist  persist        = {};
+static bool     persistDirty   = false;
+static uint32_t lastSaveMs     = 0;
+static uint32_t uptimeAccumMs  = 0;     // session-local ms credited to totalUptimeS
+
+static void defaultName(char out[17]) {
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  // Pwnagotchi-style two-syllable name seeded by MAC last 3 bytes.
+  static const char* syl[] = {
+    "div","pwn","kai","zen","ash","rin","nox","vex","lux","jin",
+    "kai","mio","tau","ren","yuu","oni","ryo","aki","sei","ume"
+  };
+  uint32_t s = ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+  const char* a = syl[s % 20];
+  const char* b = syl[(s >> 5) % 20];
+  snprintf(out, 17, "%s-%s%02X", a, b, mac[5]);
+}
+
+static void persistEnsureDir() {
+  if (!SD.exists(PWN_DIR)) SD.mkdir(PWN_DIR);
+}
+
+static void persistLoad() {
+  memset(&persist, 0, sizeof(persist));
+  if (!sdReady) {
+    defaultName(persist.name);
+    return;
+  }
+  File f = SD.open(PWN_STATE_PATH, FILE_READ);
+  if (!f) {
+    defaultName(persist.name);
+    return;
+  }
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    defaultName(persist.name);
+    return;
+  }
+  const char* nm = doc["name"] | "";
+  if (nm[0]) { strncpy(persist.name, nm, 16); persist.name[16] = 0; }
+  else       { defaultName(persist.name); }
+  persist.totalHandshakes = doc["handshakes"] | 0u;
+  persist.totalPmkids     = doc["pmkids"]     | 0u;
+  persist.totalUptimeS    = doc["uptime_s"]   | 0u;
+  persist.sessions        = doc["sessions"]   | 0u;
+  persist.bestSession     = doc["best"]       | 0u;
+}
+
+static void persistSaveNow() {
+  if (!sdReady) return;
+  persistEnsureDir();
+  File f = SD.open(PWN_STATE_PATH, FILE_WRITE);
+  if (!f) return;
+  StaticJsonDocument<512> doc;
+  doc["name"]       = persist.name;
+  doc["handshakes"] = persist.totalHandshakes;
+  doc["pmkids"]     = persist.totalPmkids;
+  doc["uptime_s"]   = persist.totalUptimeS;
+  doc["sessions"]   = persist.sessions;
+  doc["best"]       = persist.bestSession;
+  serializeJson(doc, f);
+  f.close();
+  persistDirty = false;
+  lastSaveMs   = millis();
+}
+
+static void persistMaybeSave(uint32_t now) {
+  if (!persistDirty) return;
+  if ((uint32_t)(now - lastSaveMs) < PWN_SAVE_MIN_MS) return;
+  persistSaveNow();
+}
+
+static void persistTickUptime(uint32_t now) {
+  static uint32_t lastTickMs = 0;
+  if (lastTickMs == 0) { lastTickMs = now; return; }
+  uint32_t dt = now - lastTickMs;
+  lastTickMs = now;
+  uptimeAccumMs += dt;
+  while (uptimeAccumMs >= 1000) {
+    uptimeAccumMs -= 1000;
+    persist.totalUptimeS++;
+  }
+}
+
+static void formatAge(uint32_t s, char* out, size_t cap) {
+  uint32_t d = s / 86400; s %= 86400;
+  uint32_t h = s / 3600;  s %= 3600;
+  uint32_t m = s / 60;
+  if (d > 0)      snprintf(out, cap, "%lud %02luh", (unsigned long)d, (unsigned long)h);
+  else if (h > 0) snprintf(out, cap, "%luh %02lum", (unsigned long)h, (unsigned long)m);
+  else            snprintf(out, cap, "%lum",        (unsigned long)m);
+}
+
+// ── Minimal NMEA reader (RMC + GGA) for GPS-tagged captures ──────────────────
+static HardwareSerial pwnGps(2);
+static bool     gpsEnabled        = false;
+static bool     gpsFixValid       = false;
+static double   gpsLat            = 0.0;
+static double   gpsLon            = 0.0;
+static char     gpsUtc[10]        = "--:--:--";
+static char     gpsDate[10]       = "--/--/--";
+static uint8_t  gpsFixQ           = 0;       // GGA fix quality
+static uint8_t  gpsSatsUsed       = 0;
+static uint32_t gpsLastFixMs      = 0;
+static char     gpsLineBuf[100];
+static uint8_t  gpsLineLen        = 0;
+
+static double pwnDmToDeg(const char* dm, char dir) {
+  if (!dm || !*dm) return 0.0;
+  double v = strtod(dm, nullptr);
+  int deg = (int)(v / 100.0);
+  double mins = v - (double)deg * 100.0;
+  double dec = (double)deg + mins / 60.0;
+  if (dir == 'S' || dir == 'W') dec = -dec;
+  return dec;
+}
+
+static void pwnParseRmc(char* s) {
+  // $..RMC,utc,status,lat,N/S,lon,E/W,sog,cog,date,...
+  const char* f[14] = {0};
+  int nf = 0; f[nf++] = s;
+  for (char* p = s; *p && nf < 14; ++p) {
+    if (*p == ',') { *p = 0; f[nf++] = p + 1; }
+    else if (*p == '*') { *p = 0; break; }
+  }
+  if (nf < 10) return;
+  if (f[1] && strlen(f[1]) >= 6) {
+    snprintf(gpsUtc, sizeof(gpsUtc), "%c%c:%c%c:%c%c",
+             f[1][0], f[1][1], f[1][2], f[1][3], f[1][4], f[1][5]);
+  }
+  gpsFixValid = (f[2] && f[2][0] == 'A');
+  if (gpsFixValid && f[3] && f[5]) {
+    gpsLat = pwnDmToDeg(f[3], f[4] ? f[4][0] : 0);
+    gpsLon = pwnDmToDeg(f[5], f[6] ? f[6][0] : 0);
+    gpsLastFixMs = millis();
+  }
+  if (f[9] && strlen(f[9]) >= 6) {
+    snprintf(gpsDate, sizeof(gpsDate), "%c%c/%c%c/%c%c",
+             f[9][0], f[9][1], f[9][2], f[9][3], f[9][4], f[9][5]);
+  }
+}
+
+static void pwnParseGga(char* s) {
+  // $..GGA,utc,lat,N/S,lon,E/W,fixQ,nSats,...
+  const char* f[10] = {0};
+  int nf = 0; f[nf++] = s;
+  for (char* p = s; *p && nf < 10; ++p) {
+    if (*p == ',') { *p = 0; f[nf++] = p + 1; }
+    else if (*p == '*') { *p = 0; break; }
+  }
+  if (nf < 8) return;
+  gpsFixQ     = f[6] ? (uint8_t)strtol(f[6], nullptr, 10) : 0;
+  gpsSatsUsed = f[7] ? (uint8_t)strtol(f[7], nullptr, 10) : 0;
+}
+
+static void pwnGpsDispatch(char* line) {
+  if (line[0] != '$' || strlen(line) < 7) return;
+  if (line[3] == 'R' && line[4] == 'M' && line[5] == 'C') pwnParseRmc(line);
+  else if (line[3] == 'G' && line[4] == 'G' && line[5] == 'A') pwnParseGga(line);
+}
+
+static void pwnGpsFeed() {
+  if (!gpsEnabled) return;
+  while (pwnGps.available()) {
+    char c = (char)pwnGps.read();
+    if (c == '\n') {
+      gpsLineBuf[gpsLineLen] = 0;
+      if (gpsLineLen > 0) pwnGpsDispatch(gpsLineBuf);
+      gpsLineLen = 0;
+    } else if (c == '\r') {
+      continue;
+    } else if (gpsLineLen + 1 < sizeof(gpsLineBuf)) {
+      gpsLineBuf[gpsLineLen++] = c;
+    } else {
+      gpsLineLen = 0;
+    }
+  }
+}
+
+static void pwnGpsBegin() {
+  GpsWardriver::stopBackgroundIfRunning();
+  pwnGps.end();
+  pwnGps.begin(9600, SERIAL_8N1, GPS_UART_RX, GPS_UART_TX);
+  gpsEnabled  = true;
+  gpsFixValid = false;
+  gpsLineLen  = 0;
+  gpsFixQ = 0; gpsSatsUsed = 0;
+  strncpy(gpsUtc,  "--:--:--", sizeof(gpsUtc));
+  strncpy(gpsDate, "--/--/--", sizeof(gpsDate));
+}
+
+static void pwnGpsEnd() {
+  if (!gpsEnabled) return;
+  pwnGps.end();
+  gpsEnabled = false;
+}
+
+// ── CSV capture log (parallel to handshakes.22000) ───────────────────────────
+static constexpr const char* PWN_CSV_PATH = "/captures/handshakes.csv";
+static void ensureCapturesDir();   // defined below
+static void friendUpsert(const uint8_t* bssid, const char* name,
+                         uint32_t lifetime, int8_t rssi);
+static bool parseFriendBeacon(const uint8_t* p, int len,
+                              char outName[17], uint32_t* outLifetime);
+
+static void appendCsvLine(const char* kind,
+                          const BssidEntry& ap,
+                          const uint8_t* sta) {
+  ensureCapturesDir();
+  bool fresh = !SD.exists(PWN_CSV_PATH);
+  File f = SD.open(PWN_CSV_PATH, FILE_APPEND);
+  if (!f) return;
+  if (fresh) {
+    f.println("type,utc,date,bssid,ssid,channel,sta,lat,lon,fixq,sats");
+  }
+  char bssidStr[18], staStr[18];
+  snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+  snprintf(staStr, sizeof(staStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
+
+  // SSID sanitization: drop commas and quotes so CSV stays simple.
+  char safeSsid[40] = {0};
+  size_t j = 0;
+  for (size_t i = 0; ap.ssid[i] && j + 1 < sizeof(safeSsid); i++) {
+    char c = ap.ssid[i];
+    if (c == ',' || c == '"' || c < 0x20) c = '_';
+    safeSsid[j++] = c;
+  }
+
+  if (gpsFixValid) {
+    f.printf("%s,%s,%s,%s,%s,%u,%s,%.6f,%.6f,%u,%u\n",
+             kind, gpsUtc, gpsDate, bssidStr, safeSsid,
+             (unsigned)ap.channel, staStr, gpsLat, gpsLon,
+             (unsigned)gpsFixQ, (unsigned)gpsSatsUsed);
+  } else {
+    f.printf("%s,%s,%s,%s,%s,%u,%s,,,0,0\n",
+             kind, gpsUtc, gpsDate, bssidStr, safeSsid,
+             (unsigned)ap.channel, staStr);
+  }
+  f.close();
+}
+
 // ── Face glyph strings (centered, monospace) ─────────────────────────────────
 static const char* faceStr(Face f) {
   switch (f) {
@@ -6858,7 +7119,10 @@ static void writePmkid(const BssidEntry& ap, const uint8_t* sta, const uint8_t p
   f.println("***");
   f.close();
   pmkidCount++;
+  persist.totalPmkids++;
+  persistDirty = true;
   lastCaptureMs = millis();
+  appendCsvLine("PMKID", ap, sta);
 }
 static void writeHandshake(const BssidEntry& ap, const InFlight& s) {
   if (!s.has_m1 || !s.has_m2 || s.m2_eapol_len < 99) return;
@@ -6876,7 +7140,10 @@ static void writeHandshake(const BssidEntry& ap, const InFlight& s) {
   f.println("*00");
   f.close();
   handshakeCount++;
+  persist.totalHandshakes++;
+  persistDirty = true;
   lastCaptureMs = millis();
+  appendCsvLine("HS", ap, s.client);
 }
 
 // ── RSN/WPA Key Data: extract PMKID-KDE (OUI 00-0F-AC type 4) ────────────────
@@ -6934,6 +7201,15 @@ static void rxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     char ssid[33]; uint8_t ch = 0;
     parseBeacon(p, len, ssid, &ch);
     upsertBssid(bssid, ssid[0] ? ssid : nullptr, ch ? ch : currentChannel);
+
+    // Skip our own beacon (we transmit broadcasts with our MAC).
+    uint8_t self[6]; esp_read_mac(self, ESP_MAC_WIFI_STA);
+    if (memcmp(bssid, self, 6) != 0) {
+      char fname[17]; uint32_t flife = 0;
+      if (parseFriendBeacon(p, len, fname, &flife)) {
+        friendUpsert(bssid, fname, flife, pkt->rx_ctrl.rssi);
+      }
+    }
     return;
   }
 
@@ -7001,6 +7277,261 @@ static void rxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   }
 }
 
+// ── Friend detection (vendor IE in beacons) ──────────────────────────────────
+// Custom vendor-OUI signature so other Dark-Div Pwns recognize each other.
+static constexpr uint8_t PWN_OUI[3]      = {0xDA, 0x4B, 0x01};
+static constexpr uint8_t PWN_VENDOR_TYPE = 0x70;     // 'p' for "pwn"
+static constexpr int     PWN_MAX_FRIENDS = 8;
+static constexpr uint32_t PWN_FRIEND_TX_INTERVAL_MS = 5000;
+static constexpr uint32_t PWN_FRIEND_TTL_MS         = 60000;
+
+struct Friend {
+  uint8_t  bssid[6];
+  char     name[17];
+  int8_t   rssi;
+  uint32_t lifetime;    // their reported lifetime captures
+  uint32_t lastSeenMs;
+};
+static Friend   friends[PWN_MAX_FRIENDS] = {};
+static int      friendCount              = 0;
+static uint32_t lastFriendTxMs           = 0;
+
+static void friendUpsert(const uint8_t* bssid, const char* name,
+                         uint32_t lifetime, int8_t rssi) {
+  uint32_t now = millis();
+  for (int i = 0; i < friendCount; i++) {
+    if (memcmp(friends[i].bssid, bssid, 6) == 0) {
+      strncpy(friends[i].name, name, 16); friends[i].name[16] = 0;
+      friends[i].lifetime   = lifetime;
+      friends[i].rssi       = rssi;
+      friends[i].lastSeenMs = now;
+      return;
+    }
+  }
+  int slot = friendCount;
+  if (slot >= PWN_MAX_FRIENDS) {
+    // Evict the oldest.
+    slot = 0;
+    for (int i = 1; i < friendCount; i++)
+      if (friends[i].lastSeenMs < friends[slot].lastSeenMs) slot = i;
+  } else {
+    friendCount++;
+  }
+  memcpy(friends[slot].bssid, bssid, 6);
+  strncpy(friends[slot].name, name, 16); friends[slot].name[16] = 0;
+  friends[slot].lifetime   = lifetime;
+  friends[slot].rssi       = rssi;
+  friends[slot].lastSeenMs = now;
+}
+
+static void friendsExpire() {
+  uint32_t now = millis();
+  int w = 0;
+  for (int i = 0; i < friendCount; i++) {
+    if ((uint32_t)(now - friends[i].lastSeenMs) <= PWN_FRIEND_TTL_MS) {
+      if (w != i) friends[w] = friends[i];
+      w++;
+    }
+  }
+  friendCount = w;
+}
+
+// Tries to extract our vendor IE from a beacon's tagged params.
+static bool parseFriendBeacon(const uint8_t* p, int len,
+                              char outName[17], uint32_t* outLifetime) {
+  if (len < 36) return false;
+  int i = 36;
+  while (i + 2 <= len) {
+    uint8_t tag = p[i], tlen = p[i + 1];
+    if (i + 2 + tlen > len) return false;
+    if (tag == 0xDD && tlen >= 4 + 1 + 4
+        && p[i + 2] == PWN_OUI[0] && p[i + 3] == PWN_OUI[1]
+        && p[i + 4] == PWN_OUI[2] && p[i + 5] == PWN_VENDOR_TYPE) {
+      const uint8_t* payload = &p[i + 6];
+      int payLen = tlen - 4;            // OUI(3)+type(1) consumed
+      // Layout: name_len(1) + name(name_len) + lifetime_be32(4)
+      if (payLen < 1) return false;
+      int nameLen = payload[0];
+      if (nameLen < 0 || nameLen > 16) return false;
+      if (payLen < 1 + nameLen + 4) return false;
+      memcpy(outName, &payload[1], nameLen);
+      outName[nameLen] = 0;
+      const uint8_t* lp = &payload[1 + nameLen];
+      *outLifetime = ((uint32_t)lp[0] << 24) | ((uint32_t)lp[1] << 16)
+                   | ((uint32_t)lp[2] << 8)  |  (uint32_t)lp[3];
+      return true;
+    }
+    i += 2 + tlen;
+  }
+  return false;
+}
+
+static void transmitFriendBeacon() {
+  uint8_t buf[128] = {0};
+  int n = 0;
+
+  // 802.11 mgmt header — beacon (type=0, subtype=8).
+  buf[n++] = 0x80; buf[n++] = 0x00;          // Frame Control
+  buf[n++] = 0x00; buf[n++] = 0x00;          // Duration
+  for (int i = 0; i < 6; i++) buf[n++] = 0xFF;       // DA: broadcast
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  for (int i = 0; i < 6; i++) buf[n++] = mac[i];      // SA
+  for (int i = 0; i < 6; i++) buf[n++] = mac[i];      // BSSID (our MAC)
+  buf[n++] = 0x00; buf[n++] = 0x00;                   // Seq ctrl
+
+  // Fixed beacon body.
+  for (int i = 0; i < 8; i++) buf[n++] = 0;           // timestamp
+  buf[n++] = 0x64; buf[n++] = 0x00;                   // beacon interval (100 TU)
+  buf[n++] = 0x01; buf[n++] = 0x04;                   // cap info (ESS+ShortPreamble)
+
+  // Tag 0: SSID = "DivPwn:<name>"
+  char ssid[33];
+  int slen = snprintf(ssid, sizeof(ssid), "DivPwn:%s", persist.name);
+  if (slen > 32) slen = 32;
+  buf[n++] = 0x00; buf[n++] = (uint8_t)slen;
+  memcpy(&buf[n], ssid, slen); n += slen;
+
+  // Tag 1: Supported rates (mandatory in most decoders).
+  buf[n++] = 0x01; buf[n++] = 0x01; buf[n++] = 0x82;  // 1 Mbit basic
+
+  // Tag 3: DS Parameter — current channel.
+  buf[n++] = 0x03; buf[n++] = 0x01; buf[n++] = currentChannel;
+
+  // Tag 0xDD: vendor IE — OUI + type + payload.
+  uint32_t lifetime = persist.totalHandshakes + persist.totalPmkids;
+  int nameLen = (int)strlen(persist.name);
+  if (nameLen > 16) nameLen = 16;
+  uint8_t ieLen = (uint8_t)(3 + 1 + 1 + nameLen + 4);
+  buf[n++] = 0xDD; buf[n++] = ieLen;
+  buf[n++] = PWN_OUI[0]; buf[n++] = PWN_OUI[1]; buf[n++] = PWN_OUI[2];
+  buf[n++] = PWN_VENDOR_TYPE;
+  buf[n++] = (uint8_t)nameLen;
+  memcpy(&buf[n], persist.name, nameLen); n += nameLen;
+  buf[n++] = (uint8_t)((lifetime >> 24) & 0xFF);
+  buf[n++] = (uint8_t)((lifetime >> 16) & 0xFF);
+  buf[n++] = (uint8_t)((lifetime >>  8) & 0xFF);
+  buf[n++] = (uint8_t)( lifetime        & 0xFF);
+
+  Deauther::wsl_bypasser_send_raw_frame(buf, n);
+}
+
+// ── Whitelist (SD /pwn/whitelist.txt) ────────────────────────────────────────
+static constexpr const char* PWN_WHITELIST_PATH = "/pwn/whitelist.txt";
+static constexpr int  PWN_WHITELIST_MAX_BSSID = 16;
+static constexpr int  PWN_WHITELIST_MAX_SSID  = 16;
+static uint8_t whitelistBssid[PWN_WHITELIST_MAX_BSSID][6];
+static int     whitelistBssidCount = 0;
+static char    whitelistSsid[PWN_WHITELIST_MAX_SSID][33];
+static int     whitelistSsidCount = 0;
+
+static bool parseMac(const char* s, uint8_t out[6]) {
+  unsigned v[6];
+  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+    return false;
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+  return true;
+}
+
+static void loadWhitelist() {
+  whitelistBssidCount = 0;
+  whitelistSsidCount  = 0;
+  if (!sdReady) return;
+  File f = SD.open(PWN_WHITELIST_PATH, FILE_READ);
+  if (!f) return;
+  char line[64];
+  while (f.available()) {
+    int n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (n <= 0) break;
+    line[n] = 0;
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t')) line[--n] = 0;
+    char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 0 || *p == '#') continue;
+    uint8_t mac[6];
+    if (parseMac(p, mac)) {
+      if (whitelistBssidCount < PWN_WHITELIST_MAX_BSSID)
+        memcpy(whitelistBssid[whitelistBssidCount++], mac, 6);
+    } else {
+      if (whitelistSsidCount < PWN_WHITELIST_MAX_SSID) {
+        strncpy(whitelistSsid[whitelistSsidCount], p, 32);
+        whitelistSsid[whitelistSsidCount][32] = 0;
+        whitelistSsidCount++;
+      }
+    }
+  }
+  f.close();
+}
+
+static bool isWhitelisted(const BssidEntry& ap) {
+  for (int i = 0; i < whitelistBssidCount; i++) {
+    if (memcmp(whitelistBssid[i], ap.bssid, 6) == 0) return true;
+  }
+  if (ap.ssid[0]) {
+    for (int i = 0; i < whitelistSsidCount; i++) {
+      if (strcmp(whitelistSsid[i], ap.ssid) == 0) return true;
+    }
+  }
+  return false;
+}
+
+// ── Adaptive channel scheduler ───────────────────────────────────────────────
+static constexpr int      PWN_CH_MIN          = 1;
+static constexpr int      PWN_CH_MAX          = 13;
+static constexpr uint32_t PWN_DWELL_MIN_MS    = 3000;
+static constexpr uint32_t PWN_DWELL_MAX_MS    = 12000;
+static constexpr int      PWN_COOLDOWN_MAX    = 3;     // visits to skip when empty
+
+struct ChanStat {
+  uint16_t score;        // last-visit activity (eapol*4 + beacons + apsHere)
+  uint8_t  cooldown;     // visits remaining before this channel is reconsidered
+};
+static ChanStat chanStats[PWN_CH_MAX + 2] = {};
+static uint32_t curDwellMs                = PWN_CHANNEL_DWELL_MS;
+static uint32_t snapEapol                 = 0;
+static uint32_t snapBeacons               = 0;
+
+static int apsOnChannel(uint8_t ch) {
+  int n = 0;
+  for (int i = 0; i < bssidCount; i++) if (bssidTbl[i].channel == ch) n++;
+  return n;
+}
+
+static void closeOutChannel() {
+  uint16_t dEapol   = (uint16_t)(eapolSeen   - snapEapol);
+  uint16_t dBeacons = (uint16_t)(beaconsSeen - snapBeacons);
+  uint16_t score    = (uint16_t)(dEapol * 4 + dBeacons + apsOnChannel(currentChannel));
+  if (currentChannel >= PWN_CH_MIN && currentChannel <= PWN_CH_MAX) {
+    chanStats[currentChannel].score    = score;
+    chanStats[currentChannel].cooldown = (score == 0)
+      ? (uint8_t)min<int>(chanStats[currentChannel].cooldown + 1, PWN_COOLDOWN_MAX)
+      : 0;
+  }
+  // Adapt next dwell: extend on hot channels, contract on empty ones.
+  if      (score >= 8)  curDwellMs = PWN_DWELL_MAX_MS;
+  else if (score >= 2)  curDwellMs = PWN_CHANNEL_DWELL_MS;
+  else                  curDwellMs = PWN_DWELL_MIN_MS;
+}
+
+static uint8_t pickNextChannel() {
+  uint8_t start = (currentChannel >= PWN_CH_MAX) ? PWN_CH_MIN : (uint8_t)(currentChannel + 1);
+  uint8_t ch    = start;
+  for (int tries = 0; tries < PWN_CH_MAX; tries++) {
+    if (chanStats[ch].cooldown == 0) return ch;
+    chanStats[ch].cooldown--;
+    ch = (ch >= PWN_CH_MAX) ? PWN_CH_MIN : (uint8_t)(ch + 1);
+  }
+  // All cooled down — sweep anyway, reset cooldowns.
+  for (int i = PWN_CH_MIN; i <= PWN_CH_MAX; i++) chanStats[i].cooldown = 0;
+  return start;
+}
+
+static void openChannel(uint8_t ch) {
+  currentChannel = ch;
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  snapEapol   = eapolSeen;
+  snapBeacons = beaconsSeen;
+}
+
 // ── Deauth burst across every AP on the current channel ──────────────────────
 static void deauthOnCurrentChannel() {
   uint8_t f[26] = {
@@ -7012,6 +7543,7 @@ static void deauthOnCurrentChannel() {
   };
   for (int i = 0; i < bssidCount; i++) {
     if (bssidTbl[i].channel != currentChannel) continue;
+    if (isWhitelisted(bssidTbl[i])) continue;
     memcpy(&f[10], bssidTbl[i].bssid, 6);
     memcpy(&f[16], bssidTbl[i].bssid, 6);
     for (int j = 0; j < 6; j++) {
@@ -7061,36 +7593,76 @@ static void drawHud() {
   tft.setTextFont(2);
   tft.setTextSize(1);
   char buf[64];
+  char age[16];
 
-  tft.setTextColor(ARA_RED, TFT_BLACK);
-  tft.setCursor(10, 100);
-  snprintf(buf, sizeof(buf), "PMKIDs:       %lu", (unsigned long)pmkidCount);   tft.print(buf);
-  tft.setCursor(10, 118);
-  snprintf(buf, sizeof(buf), "Handshakes:   %lu", (unsigned long)handshakeCount); tft.print(buf);
+  // Identity header (name + age).
+  formatAge(persist.totalUptimeS, age, sizeof(age));
+  tft.setTextColor(ARA_GRN, TFT_BLACK);
+  tft.setCursor(10, 94);
+  snprintf(buf, sizeof(buf), "%s  age %s", persist.name, age);
+  tft.print(buf);
 
+  // Lifetime totals.
   tft.setTextColor(ARA_MID, TFT_BLACK);
-  tft.setCursor(10, 142);
+  tft.setCursor(10, 112);
+  snprintf(buf, sizeof(buf), "Lifetime HS:%lu  PMKID:%lu  run#%lu",
+           (unsigned long)persist.totalHandshakes,
+           (unsigned long)persist.totalPmkids,
+           (unsigned long)persist.sessions);
+  tft.print(buf);
+
+  // Session captures.
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setCursor(10, 134);
+  snprintf(buf, sizeof(buf), "Sess PMKID:   %lu", (unsigned long)pmkidCount);   tft.print(buf);
+  tft.setCursor(10, 150);
+  snprintf(buf, sizeof(buf), "Sess HS:      %lu", (unsigned long)handshakeCount); tft.print(buf);
+
+  // Scan stats.
+  tft.setTextColor(ARA_MID, TFT_BLACK);
+  tft.setCursor(10, 172);
   snprintf(buf, sizeof(buf), "APs seen:     %d", bssidCount);                   tft.print(buf);
-  tft.setCursor(10, 160);
+  tft.setCursor(10, 188);
   snprintf(buf, sizeof(buf), "Beacons:      %lu", (unsigned long)beaconsSeen);  tft.print(buf);
-  tft.setCursor(10, 178);
+  tft.setCursor(10, 204);
   snprintf(buf, sizeof(buf), "EAPOL frames: %lu", (unsigned long)eapolSeen);    tft.print(buf);
 
   tft.setTextColor(ARA_RED, TFT_BLACK);
-  tft.setCursor(10, 206);
-  snprintf(buf, sizeof(buf), "Channel:      %u", currentChannel);               tft.print(buf);
+  tft.setCursor(10, 226);
+  snprintf(buf, sizeof(buf), "Ch:%u  dwell:%us  WL:%d  fr:%d",
+           currentChannel,
+           (unsigned)(curDwellMs / 1000),
+           whitelistBssidCount + whitelistSsidCount,
+           friendCount);
+  tft.print(buf);
+
 
   uint32_t up = (millis() - startMs) / 1000;
-  tft.setCursor(10, 224);
-  snprintf(buf, sizeof(buf), "Uptime:       %02lu:%02lu:%02lu",
+  tft.setCursor(10, 242);
+  snprintf(buf, sizeof(buf), "Sess uptime:  %02lu:%02lu:%02lu",
            (unsigned long)(up / 3600),
            (unsigned long)((up / 60) % 60),
            (unsigned long)(up % 60));
   tft.print(buf);
 
+  // GPS status.
+  if (gpsFixValid) {
+    tft.setTextColor(ARA_GRN, TFT_BLACK);
+    tft.setCursor(10, 260);
+    snprintf(buf, sizeof(buf), "GPS: %.4f,%.4f  s%u",
+             gpsLat, gpsLon, (unsigned)gpsSatsUsed);
+    tft.print(buf);
+  } else {
+    tft.setTextColor(ARA_DIM, TFT_BLACK);
+    tft.setCursor(10, 260);
+    snprintf(buf, sizeof(buf), "GPS: searching  q%u s%u",
+             (unsigned)gpsFixQ, (unsigned)gpsSatsUsed);
+    tft.print(buf);
+  }
+
   tft.setTextColor(sdReady ? ARA_GRN : ARA_RED, TFT_BLACK);
-  tft.setCursor(10, 252);
-  tft.print(sdReady ? "SD: writing /captures/handshakes.22000"
+  tft.setCursor(10, 276);
+  tft.print(sdReady ? "SD: /captures/.22000+.csv"
                     : "SD: NOT READY (no card?)");
 }
 
@@ -7118,12 +7690,26 @@ void pwnSetup() {
 
   sdReady = (SD.cardSize() > 0);
 
+  persistLoad();
+  persist.sessions++;
+  persistDirty = true;
+  uptimeAccumMs = 0;
+
+  loadWhitelist();
+  memset(chanStats, 0, sizeof(chanStats));
+  curDwellMs = PWN_CHANNEL_DWELL_MS;
+
+  pwnGpsBegin();
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, true);
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous_rx_cb(&rxCallback);
   esp_wifi_set_promiscuous(true);
+  // Initialize per-channel snapshots after promiscuous is up so counters are sane.
+  snapEapol   = eapolSeen;
+  snapBeacons = beaconsSeen;
 
   drawShell();
   drawFace();
@@ -7133,12 +7719,37 @@ void pwnSetup() {
 void pwnLoop() {
   uint32_t now = millis();
 
-  // Channel hop.
-  if (now - channelStartMs >= PWN_CHANNEL_DWELL_MS) {
-    currentChannel++;
-    if (currentChannel > 13) currentChannel = 1;
-    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  pwnGpsFeed();
+  persistTickUptime(now);
+
+  // Track best-session counter.
+  uint16_t sessTotal = (uint16_t)(pmkidCount + handshakeCount);
+  if (sessTotal > persist.bestSession) {
+    persist.bestSession = sessTotal;
+    persistDirty = true;
+  }
+
+  // Save on debounce after a capture, or on heartbeat.
+  persistMaybeSave(now);
+  static uint32_t lastHeartbeatMs = 0;
+  if ((uint32_t)(now - lastHeartbeatMs) >= PWN_SAVE_HEARTBEAT_MS) {
+    lastHeartbeatMs = now;
+    persistDirty = true;
+    persistSaveNow();
+  }
+
+  // Adaptive channel hop.
+  if (now - channelStartMs >= curDwellMs) {
+    closeOutChannel();
+    openChannel(pickNextChannel());
     channelStartMs = now;
+  }
+
+  // Friend-beacon broadcast + table aging.
+  if ((uint32_t)(now - lastFriendTxMs) >= PWN_FRIEND_TX_INTERVAL_MS) {
+    lastFriendTxMs = now;
+    transmitFriendBeacon();
+    friendsExpire();
   }
 
   // Auto-deauth.
@@ -7183,6 +7794,10 @@ void pwnLoop() {
 void pwnExit() {
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(nullptr);
+  pwnGpsEnd();
+  persistTickUptime(millis());
+  persistDirty = true;
+  persistSaveNow();
 }
 
 }  // namespace PwnMode
