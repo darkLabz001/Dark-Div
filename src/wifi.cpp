@@ -6822,7 +6822,13 @@ static void drawList(int n, int sel, int scroll, int maxRows) {
   // Footer hint
   tft.setTextColor(WS_DIM, TFT_BLACK);
   tft.setCursor(8, 300);
-  tft.print("UP/DOWN  RIGHT=pick  SEL=back");
+  tft.print("UP/DN  SEL=pick  LEFT=back");
+}
+
+// Block until SELECT is released, so a held SELECT doesn't fire again in
+// whatever screen we return to.
+static void drainSelect() {
+  while (isButtonPressed(BTN_SELECT)) delay(20);
 }
 
 void run() {
@@ -6835,9 +6841,9 @@ void run() {
   int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
   if (n <= 0) {
     msg(50, "No networks found", TFT_RED);
-    msg(70, "Hold SELECT to exit");
+    msg(70, "Press SELECT to exit");
     while (!isButtonPressed(BTN_SELECT)) delay(50);
-    while (isButtonPressed(BTN_SELECT)) delay(20);
+    drainSelect();
     return;
   }
 
@@ -6847,14 +6853,15 @@ void run() {
   int scroll = 0;
   drawList(n, sel, scroll, maxRows);
 
-  bool upPrev = false, downPrev = false, rightPrev = false, selPrev = false;
+  bool upPrev = false, downPrev = false, leftPrev = false, selPrev = false;
   for (;;) {
     bool up    = isButtonPressed(BTN_UP);
     bool down  = isButtonPressed(BTN_DOWN);
-    bool right = isButtonPressed(BTN_RIGHT);
+    bool left  = isButtonPressed(BTN_LEFT);
     bool selB  = isButtonPressed(BTN_SELECT);
 
-    if (selB && !selPrev) {
+    // LEFT = back to settings, no pick.
+    if (left && !leftPrev) {
       WiFi.scanDelete();
       return;
     }
@@ -6868,10 +6875,13 @@ void run() {
       if (sel >= scroll + maxRows) scroll = sel - maxRows + 1;
       drawList(n, sel, scroll, maxRows);
     }
-    if (right && !rightPrev) {
+    // SELECT = pick this network. Drain immediately so the next screen
+    // (keyboard) doesn't see the same press.
+    if (selB && !selPrev) {
+      drainSelect();
       break;
     }
-    upPrev = up; downPrev = down; rightPrev = right; selPrev = selB;
+    upPrev = up; downPrev = down; leftPrev = left; selPrev = selB;
     delay(30);
   }
 
@@ -6908,18 +6918,18 @@ void run() {
   }
   if (WiFi.status() != WL_CONNECTED) {
     msg(90, "Failed (timeout)", TFT_RED);
-    msg(110, "Hold SELECT to exit");
+    msg(110, "Press SELECT to exit");
     while (!isButtonPressed(BTN_SELECT)) delay(50);
-    while (isButtonPressed(BTN_SELECT)) delay(20);
+    drainSelect();
     return;
   }
 
   OtaGithub::_saveCreds(ssid, pw);
   msgf(90, WS_GRN, "Connected  %s", WiFi.localIP().toString().c_str());
   msg(110, "Creds saved", WS_GRN);
-  msg(140, "Hold SELECT to exit");
+  msg(140, "Press SELECT to exit");
   while (!isButtonPressed(BTN_SELECT)) delay(50);
-  while (isButtonPressed(BTN_SELECT)) delay(20);
+  drainSelect();
 }
 
 }  // namespace WifiSetup

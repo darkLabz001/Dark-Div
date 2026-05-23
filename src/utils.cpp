@@ -1832,6 +1832,23 @@ void loop(){
   bool selectNow = isButtonPressed(BTN_SELECT);
 
   if (selectNow && !selectWasDown && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
+    // On action rows, SELECT triggers the action (same as RIGHT). Anywhere
+    // else, SELECT exits the Settings feature.
+    if (sel == WIFI_ROW) {
+      WifiSetup::run();
+      drawAll();
+      // Reset edge-detect so a still-held SELECT after exit doesn't re-fire.
+      selectWasDown = true;
+      lastActionMs  = now;
+      return;
+    }
+    if (sel == OTA_ROW) {
+      OtaGithub::run();
+      drawAll();
+      selectWasDown = true;
+      lastActionMs  = now;
+      return;
+    }
     feature_exit_requested = true;
     lastActionMs = now;
     return;
