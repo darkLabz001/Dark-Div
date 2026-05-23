@@ -147,3 +147,13 @@ namespace OtaGithub {
   // on-screen keyboard the first time it's invoked; persists them in NVS.
   void run();
 }
+namespace PwnMode {
+  // Autonomous channel-hopping handshake hunter. Reuses HandshakeCapture's
+  // EAPOL/PMKID parser but on every BSSID, not a single target, and walks
+  // channels 1-13 on a 5 s dwell. Periodic broadcast deauths provoke fresh
+  // handshakes. Saves to /captures/handshakes.22000 just like the targeted
+  // capture mode. RIGHT = manual deauth on current channel, SELECT = exit.
+  void pwnSetup();
+  void pwnLoop();
+  void pwnExit();
+}
