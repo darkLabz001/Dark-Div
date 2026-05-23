@@ -3256,8 +3256,9 @@ void setup() {
   ledcAttachPin(BACKLIGHT_PIN, PWM_CHANNEL);
   setBrightness(100);
 
-  loading(100, UI_ICON, 0, 0, 2, true);
-
+  // Skull loading animation removed — doesn't fit the Dark-Div / Arasaka
+  // aesthetic. Other callers of loading() (in-feature "Scanning..." spinners)
+  // are left in place.
   tft.fillScreen(TFT_BLACK);
 
   // Color arg is ignored by the Dark-Div Arasaka splash — it drives its own
