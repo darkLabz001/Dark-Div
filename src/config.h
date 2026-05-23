@@ -135,3 +135,8 @@ namespace FirmwareUpdate {
   void updateSetup();
   void updateLoop();
 }
+namespace HandshakeCapture {
+  void hscapSetup();
+  void hscapLoop();
+  void hscapExit();
+}

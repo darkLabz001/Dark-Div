@@ -47,7 +47,7 @@ const unsigned char *bitmap_icons[NUM_MENU_ITEMS] = {
 int current_menu_index = 0;
 bool is_main_menu = false;
 
-const int NUM_SUBMENU_ITEMS = 8;
+const int NUM_SUBMENU_ITEMS = 9;
 const char *submenu_items[NUM_SUBMENU_ITEMS] = {
     "Packet Monitor",
     "Beacon Spammer",
@@ -56,6 +56,7 @@ const char *submenu_items[NUM_SUBMENU_ITEMS] = {
     "Deauth Detector",
     "WiFi Scanner",
     "Captive Portal",
+    "Handshake Capture",
     "Back to Main Menu"};
 
 const int bluetooth_NUM_SUBMENU_ITEMS = 7;
@@ -152,6 +153,7 @@ const unsigned char *wifi_submenu_icons[NUM_SUBMENU_ITEMS] = {
     bitmap_icon_eye2,
     bitmap_icon_jammer,
     bitmap_icon_bash,
+    bitmap_icon_signal,        // Handshake Capture — reuse signal icon
     bitmap_icon_go_back
 };
 
@@ -595,7 +597,7 @@ void handleWiFiSubmenuButtons() {
         last_interaction_time = millis();
         delay(70);
 
-        if (current_submenu_index == 7) {
+        if (current_submenu_index == 8) {
             in_sub_menu = false;
             feature_active = false;
             feature_exit_requested = false;
@@ -1072,6 +1074,27 @@ void handleWiFiSubmenuButtons() {
                             break;
                         }
                     }
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                } else if (current_submenu_index == 7) {
+                    current_submenu_index = 7;
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    HandshakeCapture::hscapSetup();
+                    while (current_submenu_index == 7 && !feature_exit_requested) {
+                        current_submenu_index = 7;
+                        in_sub_menu = true;
+                        HandshakeCapture::hscapLoop();
+                    }
+                    HandshakeCapture::hscapExit();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
