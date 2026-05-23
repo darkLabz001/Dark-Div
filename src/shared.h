@@ -101,7 +101,9 @@ static const uint8_t OBF_WB[]   = {75, 97, 110, 109, 122, 92, 109, 107, 96, 38, 
 /* Backlight / PWM */
 #define BACKLIGHT_PIN   7
 #define PWM_CHANNEL     0
-#define PWM_FREQ        5000
+// 25 kHz keeps the backlight PWM above the audible range — 5 kHz coupled
+// into the LED driver inductor and made the board whine constantly.
+#define PWM_FREQ        25000
 #define PWM_RESOLUTION  8
 
 /* XPT2046 (Touch) SPI */
