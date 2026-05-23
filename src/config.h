@@ -154,6 +154,14 @@ namespace WifiSetup {
   // attempts a connection. Credentials are shared with OtaGithub::run().
   void run();
 }
+namespace WebDashboard {
+  // Small HTTP server on port 80 serving a single-page web UI plus JSON API
+  // endpoints (status, pwn state, captures browser, SD browser, downloads).
+  // Reuses the WiFi creds saved by WifiSetup / OtaGithub.
+  void setup();
+  void loop();
+  void exit();
+}
 namespace PwnMode {
   // Autonomous channel-hopping handshake hunter. Reuses HandshakeCapture's
   // EAPOL/PMKID parser but on every BSSID, not a single target, and walks
