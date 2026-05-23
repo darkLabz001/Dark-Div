@@ -1840,12 +1840,28 @@ static int last_rendered_page = -1;
 static int last_rendered_index = -1;
 
 static void drawNetworkRow(int i, int y, bool isSel) {
+  // Re-check bounds against the live scan count. The bg WiFi scan task can
+  // call WiFi.scanDelete() between displayWiFiList()'s count read and this
+  // row's WiFi.SSID(i) call (TOCTOU on feature_active). If the count dropped,
+  // bail rather than let the Arduino String destructor free() a bogus buffer
+  // pointer and trip "free() target pointer is outside heap areas".
+  const int liveCount = WiFi.scanComplete();
+  if (i < 0 || i >= liveCount) {
+    tft.fillRect(0, y, SCREEN_WIDTH, LIST_ROW_H, TFT_BLACK);
+    return;
+  }
+
   char buf[64];
   char ssid[12];
-  String fullSSID = WiFi.SSID(i);
-  strncpy(ssid, fullSSID.c_str(), 11);
-  ssid[11] = '\0';
-  if (fullSSID.length() > 11) strcat(ssid, "...");
+  // Copy the SSID into a local C buffer immediately; don't hold a String
+  // across the rest of the function so its destructor never runs on stale
+  // scan storage.
+  {
+    String fullSSID = WiFi.SSID(i);
+    strncpy(ssid, fullSSID.c_str(), 11);
+    ssid[11] = '\0';
+    if (fullSSID.length() > 11) strcat(ssid, "...");
+  }
 
   const int rssi = WiFi.RSSI(i);
   const int ch = WiFi.channel(i);
@@ -2244,16 +2260,16 @@ void wifiscanSetup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  int existing = WiFi.scanComplete();
-  if (existing >= 0 && bgHasResults) {
-    current_page = 0;
-    currentIndex = 0;
-    listStartIndex = 0;
-    isDetailView = false;
-    displayWiFiList(true);
-  } else {
-    startWiFiScan();
-  }
+  // Defensive: don't trust the bg scan's cached results. There's a TOCTOU
+  // race between the bg task's `!feature_active` check and its scanDelete()
+  // call that can free the records while we render. Drop any pending state
+  // and force a clean foreground scan instead. The 50 ms delay gives the bg
+  // task time to observe feature_active=true and back off before we touch
+  // WiFi state.
+  vTaskDelay(50 / portTICK_PERIOD_MS);
+  WiFi.scanDelete();
+  bgHasResults = false;
+  startWiFiScan();
 
   float currentBatteryVoltage = readBatteryVoltage();
   drawStatusBar(currentBatteryVoltage, true);
