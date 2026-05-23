@@ -35,14 +35,15 @@ const char *menu_items[NUM_MENU_ITEMS] = {
     "About"};
 
 const unsigned char *bitmap_icons[NUM_MENU_ITEMS] = {
-    bitmap_icon_wifi,
-    bitmap_icon_jammer,
-    bitmap_icon_dialog,
-    bitmap_icon_setting,
-    bitmap_icon_spoofer,
-    bitmap_icon_analyzer,
-    bitmap_icon_stat,
-    bitmap_icon_question};
+    // Dark-Div icon pack — clean monochrome glyphs (see end of icon.h).
+    bitmap_icon_dd_wifi,
+    bitmap_icon_dd_spectrum,
+    bitmap_icon_dd_more,
+    bitmap_icon_dd_settings,
+    bitmap_icon_dd_bluetooth,
+    bitmap_icon_dd_subghz,
+    bitmap_icon_dd_tools,
+    bitmap_icon_dd_about};
 
 int current_menu_index = 0;
 bool is_main_menu = false;
