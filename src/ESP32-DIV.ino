@@ -488,137 +488,111 @@ static const char* main_menu_tags[NUM_MENU_ITEMS] = {
     "[?]"      // 7 About
 };
 
-// Render the icon area of a main-menu tile as an Arasaka-style HUD block:
-// red corner brackets at the top, a vertical accent stripe on the left of
-// the icon zone, a small "status LED" on the right, and the bracketed tag
-// in tight font-1 mono. When the tile is the active selection we add a
-// chevron pointer and a thin scan-line under the tag for a "locked in"
-// look. The wider tile bg / outline / label below are still drawn by the
-// caller (displayMenu) — this function only paints the icon-zone HUD.
-static void drawMainMenuTag(int tile_x, int tile_y, const char* tag, uint16_t selColor) {
-  // Arasaka palette — hard-coded for visual identity regardless of theme.
-  const uint16_t ARA_RED  = tft.color565(220, 30, 40);
-  const uint16_t ARA_DIM  = tft.color565( 95,  5, 15);
-  const bool selected     = (selColor == SELECTED_ICON_COLOR);
-  const uint16_t accent   = selected ? ARA_RED : ARA_DIM;
+// Full Arasaka HUD main-menu tile.  Sharp angular outline with diagonal cut
+// corners (top-left and bottom-right), a "XX." index prefix in dim red,
+// the bracketed tag in tight mono, a status LED, a horizontal separator,
+// then the menu label in red (no white anywhere). Selected tiles render
+// every element in bright red, plus add inward-pointing chevrons on both
+// sides of the label and a scan-line under it.
+static void drawMainMenuTile(int tile_x, int tile_y, int idx, bool selected) {
+  const uint16_t ARA_RED  = tft.color565(230, 30, 45);   // bright on/active red
+  const uint16_t ARA_MID  = tft.color565(150, 12, 22);   // mid inactive red
+  const uint16_t ARA_DIM  = tft.color565( 80,  5, 12);   // dim sub-elements
+  const uint16_t TILE_BG  = TFT_BLACK;
+  const uint16_t accent   = selected ? ARA_RED : ARA_MID;
+  const uint16_t dim      = selected ? ARA_RED : ARA_DIM;
 
-  const int bx = tile_x;
-  const int by = tile_y;
+  const int W = 100, H = 60;
 
-  // Top corner brackets (6 px L shapes inset 3 px from each top corner).
-  tft.drawFastHLine(bx + 3,  by + 3, 6, accent);
-  tft.drawFastVLine(bx + 3,  by + 3, 6, accent);
-  tft.drawFastHLine(bx + 91, by + 3, 6, accent);
-  tft.drawFastVLine(bx + 96, by + 3, 6, accent);
+  // Tile bg (sharp rect — no rounded corners).
+  tft.fillRect(tile_x, tile_y, W, H, TILE_BG);
 
-  // Left vertical accent stripe in the icon zone.
-  tft.fillRect(bx + 10, by + 11, 2, 12, accent);
+  // Outline.
+  tft.drawRect(tile_x, tile_y, W, H, accent);
 
-  // Right-side status LED.
-  tft.fillRect(bx + 84, by + 14, 4, 4, accent);
+  // Cut corners: top-left and bottom-right (3 px chamfer).
+  tft.fillRect(tile_x,        tile_y,        4, 4, TILE_BG);
+  tft.drawLine(tile_x,        tile_y + 4, tile_x + 4, tile_y,        accent);
+  tft.fillRect(tile_x + W - 4, tile_y + H - 4, 4, 4, TILE_BG);
+  tft.drawLine(tile_x + W - 5, tile_y + H - 1, tile_x + W - 1, tile_y + H - 5, accent);
 
-  // Tag in tight GLCD font (font 1, size 1 = 6px wide chars). Bright red
-  // when selected, dim red otherwise.
+  // Index prefix "01." through "08." in dim red, top-left.
+  char numBuf[8];
+  snprintf(numBuf, sizeof(numBuf), "%02d.", idx + 1);
   tft.setTextFont(1);
   tft.setTextSize(1);
-  tft.setTextColor(selected ? ARA_RED : ARA_DIM, UI_FG);
-  tft.setCursor(bx + 17, by + 14);
-  tft.print(tag);
+  tft.setTextColor(dim, TILE_BG);
+  tft.setCursor(tile_x + 8, tile_y + 6);
+  tft.print(numBuf);
 
-  // Selection extras: chevron pointer + thin scan-line under the tag.
+  // Bracketed tag — main glyph.
+  tft.setTextColor(accent, TILE_BG);
+  tft.setCursor(tile_x + 28, tile_y + 6);
+  tft.print(main_menu_tags[idx]);
+
+  // Status LED on the far right of the top zone.
+  tft.fillRect(tile_x + W - 12, tile_y + 6, 4, 4, accent);
+
+  // Horizontal HUD separator between the top zone and the label.
+  tft.drawFastHLine(tile_x + 4, tile_y + 18, W - 8, dim);
+
+  // Menu label — red, no white. Font 2 size 1, centered.
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(accent, TILE_BG);
+  const char* lbl = menu_items[idx];
+  int lblW = tft.textWidth(lbl);
+  tft.setCursor(tile_x + (W - lblW) / 2, tile_y + 26);
+  tft.print(lbl);
+
+  // Active-tile flourishes: chevrons hugging the label + scan-line below.
   if (selected) {
-    tft.fillTriangle(bx + 14, by + 13,
-                     bx + 14, by + 19,
-                     bx + 17, by + 16, ARA_RED);
-    tft.drawFastHLine(bx + 8, by + 25, 84, ARA_RED);
+    int chevY = tile_y + 28;
+    tft.fillTriangle(tile_x + 3,     chevY,     tile_x + 3,     chevY + 6,
+                     tile_x + 7,     chevY + 3, ARA_RED);
+    tft.fillTriangle(tile_x + W - 4, chevY,     tile_x + W - 4, chevY + 6,
+                     tile_x + W - 8, chevY + 3, ARA_RED);
+    tft.drawFastHLine(tile_x + 4, tile_y + H - 6, W - 8, ARA_RED);
   }
 
-  // Restore font/size so the menu label rendered after this draws normally.
+  // Restore font for any outer code that might rely on defaults.
   tft.setTextFont(2);
   tft.setTextSize(1);
 }
 
+// Helper: compute tile origin from menu index.
+static void mainMenuTilePos(int i, int& x, int& y) {
+    int column = i / 4;
+    int row    = i % 4;
+    x = (column == 0) ? X_OFFSET_LEFT : X_OFFSET_RIGHT;
+    y = Y_START + row * Y_SPACING;
+}
+
 void displayMenu() {
-
-  applyThemeToPalette(settings().theme);
-
-const uint16_t icon_colors[NUM_MENU_ITEMS] = {
-  UI_ICON,
-  UI_ICON,
-  UI_ICON,
-  UI_ICON,
-  UI_ICON,
-  UI_ICON,
-  UI_ICON,
-  UI_ICON
-};
+    applyThemeToPalette(settings().theme);
 
     submenu_initialized = false;
     last_submenu_index = -1;
     other_menu_grid_initialized = false;
     last_other_menu_index = -1;
-    tft.setTextFont(2);
 
     if (!menu_initialized) {
-        tft.fillScreen(UI_BG);
-
+        tft.fillScreen(TFT_BLACK);
         for (int i = 0; i < NUM_MENU_ITEMS; i++) {
-            int column = i / 4;
-            int row = i % 4;
-            int x_position = (column == 0) ? X_OFFSET_LEFT : X_OFFSET_RIGHT;
-            int y_position = Y_START + row * Y_SPACING;
-
-            tft.fillRoundRect(x_position, y_position, 100, 60, 5, UI_FG);
-            tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_LINE);
-            drawMainMenuTag(x_position, y_position, main_menu_tags[i], icon_colors[i]);
-
-            tft.setTextColor(UI_TEXT, UI_FG);
-            int textWidth = tft.textWidth(menu_items[i]);
-            int textX = x_position + (100 - textWidth) / 2;
-            int textY = y_position + 30;
-            tft.setCursor(textX, textY);
-            tft.print(menu_items[i]);
+            int x, y; mainMenuTilePos(i, x, y);
+            drawMainMenuTile(x, y, i, i == current_menu_index);
         }
         menu_initialized = true;
-        last_menu_index = -1;
+        last_menu_index = current_menu_index;
     }
 
     if (last_menu_index != current_menu_index) {
-        for (int i = 0; i < NUM_MENU_ITEMS; i++) {
-            int column = i / 4;
-            int row = i % 4;
-            int x_position = (column == 0) ? X_OFFSET_LEFT : X_OFFSET_RIGHT;
-            int y_position = Y_START + row * Y_SPACING;
-
-            if (i == last_menu_index) {
-                tft.fillRoundRect(x_position, y_position, 100, 60, 5, UI_FG);
-                tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_LINE);
-                tft.setTextColor(UI_TEXT, UI_FG);
-                drawMainMenuTag(x_position, y_position, main_menu_tags[last_menu_index], icon_colors[last_menu_index]);
-                int textWidth = tft.textWidth(menu_items[last_menu_index]);
-                int textX = x_position + (100 - textWidth) / 2;
-                int textY = y_position + 30;
-                tft.setCursor(textX, textY);
-                tft.print(menu_items[last_menu_index]);
-            }
+        if (last_menu_index >= 0 && last_menu_index < NUM_MENU_ITEMS) {
+            int x, y; mainMenuTilePos(last_menu_index, x, y);
+            drawMainMenuTile(x, y, last_menu_index, false);
         }
-
-        int column = current_menu_index / 4;
-        int row = current_menu_index % 4;
-        int x_position = (column == 0) ? X_OFFSET_LEFT : X_OFFSET_RIGHT;
-        int y_position = Y_START + row * Y_SPACING;
-
-        tft.fillRoundRect(x_position, y_position, 100, 60, 5, UI_FG);
-        tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_ICON);
-
-        tft.setTextColor(UI_ICON, UI_FG);
-        drawMainMenuTag(x_position, y_position, main_menu_tags[current_menu_index], SELECTED_ICON_COLOR);
-        int textWidth = tft.textWidth(menu_items[current_menu_index]);
-        int textX = x_position + (100 - textWidth) / 2;
-        int textY = y_position + 30;
-        tft.setCursor(textX, textY);
-        tft.print(menu_items[current_menu_index]);
-
+        int x, y; mainMenuTilePos(current_menu_index, x, y);
+        drawMainMenuTile(x, y, current_menu_index, true);
         last_menu_index = current_menu_index;
     }
     drawStatusBar(currentBatteryVoltage, true);
