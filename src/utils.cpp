@@ -1284,8 +1284,9 @@ static int  sel = 0;
 static bool dirtySettings = false;
 static bool uiDirty = false;
 
-static const char* items[] = {"Brightness", "Theme", "NeoPixel", "Auto Scan"};
+static const char* items[] = {"Brightness", "Theme", "NeoPixel", "Auto Scan", "OTA Update"};
 static const int N = sizeof(items)/sizeof(items[0]);
+static const int OTA_ROW = 4;
 
 static uint8_t  last_brightness;
 static Theme    last_theme;
@@ -1555,6 +1556,19 @@ static void drawAll() {
   bool autoScan = (s.autoWifiScan || s.autoBleScan);
   drawAutoScan(autoScan, sel==3);
 
+  // OTA row — action row, no toggle/widget. Just the label + "[RUN]" hint.
+  {
+    drawCardStatic(OTA_ROW, sel==OTA_ROW);
+    Rect r = rowRect(OTA_ROW);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(sel==OTA_ROW ? UI.accent : textDim, UI_BG);
+    const char* hint = "[RUN >]";
+    int hw = tft.textWidth(hint);
+    tft.setCursor(r.x + r.w - hw - 6, r.y + (r.h/2 - 6));
+    tft.print(hint);
+  }
+
   drawFooter(false, false);
 
   last_sel        = sel;
@@ -1581,6 +1595,17 @@ static void redrawIfChanged() {
     drawCardStatic(2, sel==2);  drawSwitchWidgetRow(s.neopixelEnabled, sel==2, 2);
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
     drawCardStatic(3, sel==3);  drawSwitchWidgetRow(autoScan, sel==3, 3);
+    {
+      drawCardStatic(OTA_ROW, sel==OTA_ROW);
+      Rect r = rowRect(OTA_ROW);
+      tft.setTextFont(2);
+      tft.setTextSize(1);
+      tft.setTextColor(sel==OTA_ROW ? UI.accent : textDim, UI_BG);
+      const char* hint = "[RUN >]";
+      int hw = tft.textWidth(hint);
+      tft.setCursor(r.x + r.w - hw - 6, r.y + (r.h/2 - 6));
+      tft.print(hint);
+    }
     last_sel = sel;
   } else {
     if (s.brightness != last_brightness) {
@@ -1797,6 +1822,13 @@ void loop(){
     else if (sel==1)                   { applyTheme(Theme::Light); }
     else if (sel==2)                   { applyNeoPixel(true); }
     else if (sel==3)                   { applyAutoScan(true); }
+    else if (sel==OTA_ROW)             {
+      // Action row — RIGHT triggers the OTA flow. It takes over the screen,
+      // runs to completion (reboot on success, return on failure), and we
+      // then redraw the settings UI from scratch.
+      OtaGithub::run();
+      drawAll();
+    }
     changedByButtons=true;
     lastActionMs = now;
   }

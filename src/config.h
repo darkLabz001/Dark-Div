@@ -140,3 +140,10 @@ namespace HandshakeCapture {
   void hscapLoop();
   void hscapExit();
 }
+namespace OtaGithub {
+  // Run the full "fetch latest release from github.com/darkLabz001/Dark-Div
+  // and flash it" flow. Blocks until done (success -> reboot, failure ->
+  // returns after showing an error). Prompts for WiFi credentials via the
+  // on-screen keyboard the first time it's invoked; persists them in NVS.
+  void run();
+}

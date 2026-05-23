@@ -6415,3 +6415,298 @@ void hscapExit() {
 }
 
 }  // namespace HandshakeCapture
+
+/* ════════════════════════════════════════════════════════════════════════════
+   OtaGithub — pull the latest release from github.com/darkLabz001/Dark-Div
+   and flash it over HTTPS using the Arduino Update library.
+
+   Flow:
+     1. Load saved Wi-Fi creds from NVS ("ota" namespace).  If missing,
+        prompt for SSID + password via the existing showOnScreenKeyboard().
+        Persist for next time.
+     2. WiFi.mode(STA), WiFi.begin, wait up to ~15s for IP.
+     3. HTTPS GET https://api.github.com/repos/darkLabz001/Dark-Div/releases/latest.
+        Stream-parse the JSON to find the first asset whose name ends in
+        ".bin" — that's our firmware.
+     4. HTTPS GET the asset's browser_download_url (follows the 302 to S3).
+        Pipe the response stream into Update.writeStream().
+     5. On success: Update.end(true), show "OK rebooting...", ESP.restart().
+        On failure at any step: show the error on-screen, wait, return so
+        AppSettingsUI can resume.
+
+   Cert pinning is intentionally skipped (setInsecure()) — adding a CA
+   bundle is ~3 KB of code we can pay for once OTA is otherwise working.
+   ════════════════════════════════════════════════════════════════════════════ */
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
+namespace OtaGithub {
+
+static const char* REPO          = "darkLabz001/Dark-Div";
+static const char* RELEASES_URL  = "https://api.github.com/repos/darkLabz001/Dark-Div/releases/latest";
+static const char* PREF_NS       = "ota";
+
+// ── UI helpers ──────────────────────────────────────────────────────────────
+static const uint16_t ARA_RED  = 0xE0E6;   // ~ rgb(220,30,40) in RGB565
+static const uint16_t ARA_DIM  = 0x6020;   // dim red
+static int statusY = 0;
+
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(2);
+  tft.setTextColor(ARA_RED, TFT_BLACK);
+  tft.setCursor(20, 14);
+  tft.print("[ OTA UPDATE ]");
+  tft.drawFastHLine(10, 40, 220, ARA_RED);
+  tft.setTextSize(1);
+  tft.setTextColor(ARA_DIM, TFT_BLACK);
+  tft.setCursor(20, 46);
+  tft.print(REPO);
+  tft.drawFastHLine(10, 64, 220, ARA_DIM);
+  statusY = 80;
+}
+
+static void status(const char* msg, uint16_t color = 0) {
+  if (color == 0) color = ARA_RED;
+  // Clear a few lines, scroll forward
+  tft.fillRect(0, statusY, 240, 16, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setCursor(10, statusY);
+  tft.print("> ");
+  tft.print(msg);
+  statusY += 16;
+  if (statusY > 270) {
+    // Reset to top of status area
+    tft.fillRect(0, 76, 240, 220, TFT_BLACK);
+    statusY = 80;
+  }
+}
+
+static void statusf(const char* fmt, ...) {
+  char buf[80];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  status(buf);
+}
+
+// ── NVS-backed Wi-Fi creds ──────────────────────────────────────────────────
+static bool loadCreds(String& ssid, String& pw) {
+  Preferences p;
+  if (!p.begin(PREF_NS, true)) return false;
+  ssid = p.getString("ssid", "");
+  pw   = p.getString("pw", "");
+  p.end();
+  return ssid.length() > 0;
+}
+
+static void saveCreds(const String& ssid, const String& pw) {
+  Preferences p;
+  if (!p.begin(PREF_NS, false)) return;
+  p.putString("ssid", ssid);
+  p.putString("pw",   pw);
+  p.end();
+}
+
+// ── Keyboard prompts ────────────────────────────────────────────────────────
+static const char* kbdRowsUpper[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+static const char* kbdRowsLower[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+static const char* kbdShuffles[]  = {"UPPER", "lower"};
+
+static bool promptText(const char* title1, const char* title2, String& out, bool isPassword) {
+  OnScreenKeyboardConfig cfg = {};
+  cfg.titleLine1     = title1;
+  cfg.titleLine2     = title2;
+  cfg.rows           = kbdRowsUpper;
+  cfg.rowCount       = 4;
+  cfg.maxLen         = 32;
+  cfg.shuffleNames   = kbdShuffles;
+  cfg.shuffleCount   = 2;
+  cfg.buttonsY       = 280;
+  cfg.backLabel      = "Back";
+  cfg.middleLabel    = "Case";
+  cfg.okLabel        = "OK";
+  cfg.enableShuffle  = true;
+  cfg.requireNonEmpty = !isPassword;
+  cfg.emptyErrorMsg  = "Cannot be empty";
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, out);
+  if (r.accepted) { out = r.text; return true; }
+  return false;
+}
+
+// ── Main flow ───────────────────────────────────────────────────────────────
+void run() {
+  drawShell();
+
+  String ssid, pw;
+  if (!loadCreds(ssid, pw)) {
+    status("No Wi-Fi creds saved");
+    status("Enter SSID...");
+    delay(800);
+    if (!promptText("Wi-Fi SSID", "Enter your network name", ssid, false)) {
+      drawShell();
+      status("Cancelled", TFT_RED);
+      delay(1500);
+      return;
+    }
+    drawShell();
+    status("Enter password...");
+    delay(500);
+    pw = "";
+    if (!promptText("Wi-Fi Password", "Enter your network password", pw, true)) {
+      drawShell();
+      status("Cancelled", TFT_RED);
+      delay(1500);
+      return;
+    }
+    saveCreds(ssid, pw);
+    drawShell();
+    status("Creds saved to NVS");
+  } else {
+    statusf("Saved SSID: %s", ssid.c_str());
+  }
+
+  status("Connecting WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, true);
+  WiFi.begin(ssid.c_str(), pw.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    status("Wi-Fi failed (timeout)", TFT_RED);
+    status("Hold SELECT to clear creds");
+    delay(3000);
+    return;
+  }
+  statusf("WiFi OK  %s", WiFi.localIP().toString().c_str());
+
+  status("Fetching latest release...");
+  WiFiClientSecure secure;
+  secure.setInsecure();
+  HTTPClient https;
+  https.setUserAgent("Dark-Div-OTA");
+  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  https.setTimeout(15000);
+  if (!https.begin(secure, RELEASES_URL)) {
+    status("HTTPS begin failed", TFT_RED);
+    delay(3000); return;
+  }
+  int code = https.GET();
+  if (code != HTTP_CODE_OK) {
+    statusf("API GET -> %d", code);
+    https.end();
+    delay(3000); return;
+  }
+  String body = https.getString();
+  https.end();
+
+  DynamicJsonDocument doc(16384);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    statusf("JSON parse: %s", err.c_str());
+    delay(3000); return;
+  }
+  String tag = (const char*)(doc["tag_name"] | "?");
+  String binUrl;
+  String binName;
+  size_t binSize = 0;
+  JsonArray assets = doc["assets"].as<JsonArray>();
+  for (size_t i = 0; i < assets.size(); i++) {
+    auto a = assets[i];
+    const char* name = a["name"] | "";
+    if (name[0] == '\0') continue;
+    String n(name);
+    if (n.endsWith(".bin")) {
+      binUrl  = (const char*)(a["browser_download_url"] | "");
+      binName = n;
+      binSize = (size_t)(a["size"] | 0);
+      break;
+    }
+  }
+  if (binUrl.length() == 0) {
+    status("No .bin asset in release", TFT_RED);
+    delay(3000); return;
+  }
+  statusf("Release: %s", tag.c_str());
+  statusf("Asset: %s (%u B)", binName.c_str(), (unsigned)binSize);
+
+  status("Downloading...");
+  WiFiClientSecure secure2;
+  secure2.setInsecure();
+  HTTPClient bin;
+  bin.setUserAgent("Dark-Div-OTA");
+  bin.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  bin.setTimeout(30000);
+  if (!bin.begin(secure2, binUrl)) {
+    status("Bin HTTPS begin failed", TFT_RED);
+    delay(3000); return;
+  }
+  code = bin.GET();
+  if (code != HTTP_CODE_OK) {
+    statusf("Bin GET -> %d", code);
+    bin.end();
+    delay(3000); return;
+  }
+  int contentLen = bin.getSize();
+  if (contentLen <= 0) contentLen = (int)binSize;
+  if (!Update.begin(contentLen > 0 ? contentLen : UPDATE_SIZE_UNKNOWN)) {
+    statusf("Update.begin: %s", Update.errorString());
+    bin.end();
+    delay(3000); return;
+  }
+
+  WiFiClient* stream = bin.getStreamPtr();
+  size_t written = 0;
+  size_t lastReportPct = 0;
+  uint8_t buf[1024];
+  uint32_t lastByteMs = millis();
+  while (bin.connected() && (contentLen == -1 || (int)written < contentLen)) {
+    size_t avail = stream->available();
+    if (avail) {
+      int n = stream->readBytes(buf, avail > sizeof(buf) ? sizeof(buf) : avail);
+      if (n > 0) {
+        if (Update.write(buf, n) != (size_t)n) {
+          statusf("Write fail: %s", Update.errorString());
+          Update.abort();
+          bin.end();
+          delay(3000); return;
+        }
+        written += n;
+        lastByteMs = millis();
+        if (contentLen > 0) {
+          size_t pct = (written * 100) / contentLen;
+          if (pct >= lastReportPct + 10) {
+            statusf("Wrote %u%% (%u/%u B)", (unsigned)pct, (unsigned)written, (unsigned)contentLen);
+            lastReportPct = pct;
+          }
+        }
+      }
+    } else {
+      if (millis() - lastByteMs > 10000) { status("Stream stalled", TFT_RED); Update.abort(); bin.end(); delay(3000); return; }
+      delay(2);
+    }
+  }
+  bin.end();
+
+  if (!Update.end(true)) {
+    statusf("Update.end: %s", Update.errorString());
+    delay(4000); return;
+  }
+  if (Update.isFinished()) {
+    status("OTA OK — rebooting...", TFT_GREEN);
+    delay(1800);
+    ESP.restart();
+  } else {
+    status("Update unfinished", TFT_RED);
+    delay(3000);
+  }
+}
+
+}  // namespace OtaGithub
+
