@@ -32,6 +32,10 @@ extern bool feature_exit_requested;
 
 extern void setBrightness(uint8_t value);
 bool isButtonPressed(int buttonPin);
+/* BTN_SELECT only: returns true once after a short tap (released before the
+ * long-hold threshold). Long holds suppress this — isButtonPressed(BTN_SELECT)
+ * returns true on the long-hold latch instead. Call once per loop. */
+bool isSelectShortTapped();
 
 extern float currentBatteryVoltage;
 

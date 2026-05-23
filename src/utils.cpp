@@ -1831,24 +1831,35 @@ void loop(){
   bool rightNow  = isButtonPressed(BTN_RIGHT);
   bool selectNow = isButtonPressed(BTN_SELECT);
 
-  if (selectNow && !selectWasDown && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
-    // On action rows, SELECT triggers the action (same as RIGHT). Anywhere
-    // else, SELECT exits the Settings feature.
+  // SELECT semantics now: short tap = confirm (handled here), long hold =
+  // exit (the `selectNow` branch below, since isButtonPressed(BTN_SELECT)
+  // only latches true after SELECT_HOLD_MS).
+  if (isSelectShortTapped() && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
     if (sel == WIFI_ROW) {
       WifiSetup::run();
       drawAll();
-      // Reset edge-detect so a still-held SELECT after exit doesn't re-fire.
-      selectWasDown = true;
-      lastActionMs  = now;
+      lastActionMs = now;
       return;
     }
     if (sel == OTA_ROW) {
       OtaGithub::run();
       drawAll();
-      selectWasDown = true;
-      lastActionMs  = now;
+      lastActionMs = now;
       return;
     }
+    // On widget rows, a short SELECT tap toggles/cycles.
+    auto& s = settings();
+    if      (sel == 1) applyTheme(s.theme == Theme::Dark ? Theme::Light : Theme::Dark);
+    else if (sel == 2) applyNeoPixel(!s.neopixelEnabled);
+    else if (sel == 3) {
+      bool autoScan = (s.autoWifiScan || s.autoBleScan);
+      applyAutoScan(!autoScan);
+    }
+    changedByButtons = true;
+    lastActionMs     = now;
+  }
+  if (selectNow && !selectWasDown && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
+    // Long-hold SELECT → exit Settings.
     feature_exit_requested = true;
     lastActionMs = now;
     return;

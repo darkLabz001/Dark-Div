@@ -302,8 +302,47 @@ void updateActiveSubmenu() {
     }
 }
 
+// BTN_SELECT gets press-vs-hold semantics: short tap = confirm (signalled
+// via isSelectShortTapped() below), long hold = "pressed" (latched true
+// after SELECT_HOLD_MS, stays true until release). This keeps every legacy
+// "if (isButtonPressed(BTN_SELECT)) exit" call site working — they now
+// require a long hold to fire.
+static constexpr uint32_t SELECT_HOLD_MS = 600;
+static uint32_t s_selectPressedSinceMs = 0;
+static bool     s_selectLongLatched    = false;
+static bool     s_selectShortPending   = false;   // armed on release if short
+
 bool isButtonPressed(int buttonPin) {
-  return !pcf.digitalRead(buttonPin);
+  bool raw = !pcf.digitalRead(buttonPin);
+  if (buttonPin != BTN_SELECT) return raw;
+
+  uint32_t now = millis();
+  if (raw) {
+    if (s_selectPressedSinceMs == 0) s_selectPressedSinceMs = now;
+    if (!s_selectLongLatched && (now - s_selectPressedSinceMs) >= SELECT_HOLD_MS) {
+      s_selectLongLatched  = true;
+      s_selectShortPending = false;   // already crossed long threshold
+    }
+    return s_selectLongLatched;
+  } else {
+    if (s_selectPressedSinceMs != 0 && !s_selectLongLatched) {
+      // Released before the long-hold threshold — arm a short-tap event.
+      s_selectShortPending = true;
+    }
+    s_selectPressedSinceMs = 0;
+    s_selectLongLatched    = false;
+    return false;
+  }
+}
+
+// True exactly once after a short SELECT press is released (< SELECT_HOLD_MS).
+// Consumed by the call; subsequent calls return false until the next short tap.
+bool isSelectShortTapped() {
+  if (s_selectShortPending) {
+    s_selectShortPending = false;
+    return true;
+  }
+  return false;
 }
 
 float currentBatteryVoltage = readBatteryVoltage();
