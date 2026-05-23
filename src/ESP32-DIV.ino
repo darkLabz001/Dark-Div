@@ -488,17 +488,54 @@ static const char* main_menu_tags[NUM_MENU_ITEMS] = {
     "[?]"      // 7 About
 };
 
-// Render a main-menu icon as a centered text tag inside the 100x60 tile.
-static void drawMainMenuTag(int tile_x, int tile_y, const char* tag, uint16_t color) {
-  tft.setTextFont(2);
-  tft.setTextSize(2);
-  tft.setTextColor(color, UI_FG);
-  int textW = tft.textWidth(tag);
-  int textX = tile_x + (100 - textW) / 2;
-  int textY = tile_y + 6;
-  tft.setCursor(textX, textY);
+// Render the icon area of a main-menu tile as an Arasaka-style HUD block:
+// red corner brackets at the top, a vertical accent stripe on the left of
+// the icon zone, a small "status LED" on the right, and the bracketed tag
+// in tight font-1 mono. When the tile is the active selection we add a
+// chevron pointer and a thin scan-line under the tag for a "locked in"
+// look. The wider tile bg / outline / label below are still drawn by the
+// caller (displayMenu) — this function only paints the icon-zone HUD.
+static void drawMainMenuTag(int tile_x, int tile_y, const char* tag, uint16_t selColor) {
+  // Arasaka palette — hard-coded for visual identity regardless of theme.
+  const uint16_t ARA_RED  = tft.color565(220, 30, 40);
+  const uint16_t ARA_DIM  = tft.color565( 95,  5, 15);
+  const bool selected     = (selColor == SELECTED_ICON_COLOR);
+  const uint16_t accent   = selected ? ARA_RED : ARA_DIM;
+
+  const int bx = tile_x;
+  const int by = tile_y;
+
+  // Top corner brackets (6 px L shapes inset 3 px from each top corner).
+  tft.drawFastHLine(bx + 3,  by + 3, 6, accent);
+  tft.drawFastVLine(bx + 3,  by + 3, 6, accent);
+  tft.drawFastHLine(bx + 91, by + 3, 6, accent);
+  tft.drawFastVLine(bx + 96, by + 3, 6, accent);
+
+  // Left vertical accent stripe in the icon zone.
+  tft.fillRect(bx + 10, by + 11, 2, 12, accent);
+
+  // Right-side status LED.
+  tft.fillRect(bx + 84, by + 14, 4, 4, accent);
+
+  // Tag in tight GLCD font (font 1, size 1 = 6px wide chars). Bright red
+  // when selected, dim red otherwise.
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(selected ? ARA_RED : ARA_DIM, UI_FG);
+  tft.setCursor(bx + 17, by + 14);
   tft.print(tag);
-  tft.setTextSize(1);   // restore size so the label below the tag draws normally
+
+  // Selection extras: chevron pointer + thin scan-line under the tag.
+  if (selected) {
+    tft.fillTriangle(bx + 14, by + 13,
+                     bx + 14, by + 19,
+                     bx + 17, by + 16, ARA_RED);
+    tft.drawFastHLine(bx + 8, by + 25, 84, ARA_RED);
+  }
+
+  // Restore font/size so the menu label rendered after this draws normally.
+  tft.setTextFont(2);
+  tft.setTextSize(1);
 }
 
 void displayMenu() {
