@@ -475,6 +475,32 @@ static void drawMainMenuOtherTripleIcons(int x_position, int y_position, uint16_
     tft.drawBitmap(ix + 32 + MAIN_MENU_OTHER_ICON_GAP * 2, iy, bitmap_icon_down_dots, 16, 16, iconColor);
 }
 
+// Terminal-style main-menu tag glyphs (Dark-Div / Arasaka aesthetic).
+// Six chars max so they fit the 100-wide tile in font 2 size 2.
+static const char* main_menu_tags[NUM_MENU_ITEMS] = {
+    "[WIFI]",  // 0 WiFi
+    "[2.4G]",  // 1 2.4 GHz
+    "[+++]",   // 2 More
+    "[CFG]",   // 3 Settings
+    "[BT]",    // 4 Bluetooth
+    "[SUB]",   // 5 Sub-GHz
+    "[TLS]",   // 6 Tools
+    "[?]"      // 7 About
+};
+
+// Render a main-menu icon as a centered text tag inside the 100x60 tile.
+static void drawMainMenuTag(int tile_x, int tile_y, const char* tag, uint16_t color) {
+  tft.setTextFont(2);
+  tft.setTextSize(2);
+  tft.setTextColor(color, UI_FG);
+  int textW = tft.textWidth(tag);
+  int textX = tile_x + (100 - textW) / 2;
+  int textY = tile_y + 6;
+  tft.setCursor(textX, textY);
+  tft.print(tag);
+  tft.setTextSize(1);   // restore size so the label below the tag draws normally
+}
+
 void displayMenu() {
 
   applyThemeToPalette(settings().theme);
@@ -507,11 +533,7 @@ const uint16_t icon_colors[NUM_MENU_ITEMS] = {
 
             tft.fillRoundRect(x_position, y_position, 100, 60, 5, UI_FG);
             tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_LINE);
-            if (i == MAIN_MENU_OTHER_IDX) {
-                drawMainMenuOtherTripleIcons(x_position, y_position, icon_colors[i]);
-            } else {
-                tft.drawBitmap(x_position + 42, y_position + 10, bitmap_icons[i], 16, 16, icon_colors[i]);
-            }
+            drawMainMenuTag(x_position, y_position, main_menu_tags[i], icon_colors[i]);
 
             tft.setTextColor(UI_TEXT, UI_FG);
             int textWidth = tft.textWidth(menu_items[i]);
@@ -535,11 +557,7 @@ const uint16_t icon_colors[NUM_MENU_ITEMS] = {
                 tft.fillRoundRect(x_position, y_position, 100, 60, 5, UI_FG);
                 tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_LINE);
                 tft.setTextColor(UI_TEXT, UI_FG);
-                if (last_menu_index == MAIN_MENU_OTHER_IDX) {
-                    drawMainMenuOtherTripleIcons(x_position, y_position, icon_colors[last_menu_index]);
-                } else {
-                    tft.drawBitmap(x_position + 42, y_position + 10, bitmap_icons[last_menu_index], 16, 16, icon_colors[last_menu_index]);
-                }
+                drawMainMenuTag(x_position, y_position, main_menu_tags[last_menu_index], icon_colors[last_menu_index]);
                 int textWidth = tft.textWidth(menu_items[last_menu_index]);
                 int textX = x_position + (100 - textWidth) / 2;
                 int textY = y_position + 30;
@@ -557,11 +575,7 @@ const uint16_t icon_colors[NUM_MENU_ITEMS] = {
         tft.drawRoundRect(x_position, y_position, 100, 60, 5, UI_ICON);
 
         tft.setTextColor(UI_ICON, UI_FG);
-        if (current_menu_index == MAIN_MENU_OTHER_IDX) {
-            drawMainMenuOtherTripleIcons(x_position, y_position, SELECTED_ICON_COLOR);
-        } else {
-            tft.drawBitmap(x_position + 42, y_position + 10, bitmap_icons[current_menu_index], 16, 16, SELECTED_ICON_COLOR);
-        }
+        drawMainMenuTag(x_position, y_position, main_menu_tags[current_menu_index], SELECTED_ICON_COLOR);
         int textWidth = tft.textWidth(menu_items[current_menu_index]);
         int textX = x_position + (100 - textWidth) / 2;
         int textY = y_position + 30;
