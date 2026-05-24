@@ -105,6 +105,15 @@ namespace RfDecoder {
   void loop();
   void exit();
 }
+namespace TpmsLogger {
+  // Passive TPMS (Tire Pressure Monitoring Sensor) burst logger. Detects
+  // sustained RSSI on 315/433 MHz, hashes each burst's signature into a
+  // stable sensor ID, deduplicates, GPS-tags to /captures/tpms.csv. Use
+  // it to spot cars driving past or returning to a parking lot.
+  void setup();
+  void loop();
+  void exit();
+}
 
 /* ───────────── WiFi namespaces ───────────── */
 namespace PacketMonitor {

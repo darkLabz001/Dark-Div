@@ -2459,25 +2459,41 @@ void loop() {
   }
   upPrev = up; dnPrev = dn; lfPrev = lf; rgPrev = rg;
 
-  if (isSelectShortTapped() && pktCount > 0) {
-    int idx = pktCount - 1 - selIndex;
-    if (idx >= 0) {
-      drawDetail(packets[idx]);
-      // Stay on detail screen until SELECT long-hold or LEFT save.
-      while (!isSelectHeldLong()) {
-        if (!pcf.digitalRead(BTN_LEFT)) {
-          appendCsv(packets[idx]);
-          NeoFx::event(NeoFx::Event::Capture);
-          delay(200);
-        }
-        NeoFx::tick();
-        delay(20);
-      }
+  // Detail-view state machine. Detail view stays open until LEFT (back to
+  // list) — long-hold SELECT bypasses detail and exits the feature outright.
+  static int detailIdx = -1;
+  if (isSelectShortTapped() && pktCount > 0 && detailIdx < 0) {
+    detailIdx = pktCount - 1 - selIndex;
+    if (detailIdx >= 0 && detailIdx < pktCount) {
+      drawDetail(packets[detailIdx]);
+    } else {
+      detailIdx = -1;
+    }
+  }
+
+  if (detailIdx >= 0) {
+    // Detail view active. LEFT = back to list, SEL hold = exit feature.
+    static bool lfPrevD = false;
+    bool lf = !pcf.digitalRead(BTN_LEFT);
+    if (lf && !lfPrevD) {
+      appendCsv(packets[detailIdx]);
+      NeoFx::event(NeoFx::Event::Capture);
+    }
+    lfPrevD = lf;
+    if (isSelectHeldLong()) {
+      feature_exit_requested = true;
+      detailIdx = -1;
+      return;
+    }
+    // Tap SEL again = close detail, back to list.
+    if (isSelectShortTapped()) {
+      detailIdx = -1;
       drawShell();
       drawHeader();
       drawList();
-      uiDirty = false;
     }
+    delay(15);
+    return;
   }
 
   if (uiDirty) {
@@ -2486,8 +2502,10 @@ void loop() {
     uiDirty = false;
   }
 
+  // Long-hold SELECT exits the feature.
   if (isSelectHeldLong()) {
     feature_exit_requested = true;
+    return;
   }
 
   delay(15);
@@ -2499,3 +2517,279 @@ void exit() {
 }
 
 }  // namespace RfDecoder
+
+/* ════════════════════════════════════════════════════════════════════════════
+   TpmsLogger — passive logger for nearby Tire Pressure Monitoring Sensors.
+
+   Cars broadcast a TPMS packet every ~30 s (continuous when moving) at
+   315 MHz (NA) or 433 MHz (EU). Real decoding is per-OEM and ugly; this
+   simpler version detects the bursts via RSSI thresholding and timing, then
+   hashes the burst-shape signature (envelope durations) into a stable
+   "sensor ID". Same sensor + same car → same ID across re-encounters.
+
+   Logs unique IDs to /captures/tpms.csv with first-seen timestamp + GPS
+   (if a fix is available from Pwn Mode having opened the receiver earlier).
+
+   Controls:
+     RIGHT    — toggle 315 / 433 MHz band
+     LEFT     — clear list and rescan
+     SEL hold — exit
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace TpmsLogger {
+
+static constexpr int    MAX_HITS = 32;
+static constexpr float  T_FREQS[] = { 315.0f, 433.92f };
+static constexpr int    T_NUM_FREQS = sizeof(T_FREQS) / sizeof(T_FREQS[0]);
+static constexpr int    BURST_RSSI_FLOOR = -82;   // bursts below this are noise
+static constexpr uint32_t BURST_MIN_MS   = 2;     // minimum on-air duration
+static constexpr uint32_t BURST_MAX_MS   = 80;    // longer than this = not TPMS
+static constexpr uint32_t BURST_GAP_MS   = 250;   // gap between repeats within one sensor
+
+struct TpmsHit {
+  uint32_t id;             // hash of burst shape
+  uint8_t  freqIdx;
+  int8_t   peakRssi;
+  uint32_t firstSeenMs;
+  uint32_t lastSeenMs;
+  uint16_t hitCount;
+};
+static TpmsHit  thits[MAX_HITS];
+static int      thitCount = 0;
+static int      tFreqIdx  = 0;        // start 315 MHz (NA TPMS)
+static uint32_t tStartMs  = 0;
+static uint32_t tTotalBursts = 0;
+static int      tSel      = 0;
+static int      tScroll   = 0;
+static bool     tUiDirty  = true;
+
+static const uint16_t T_RED = 0xE0E6;
+static const uint16_t T_DIM = 0x6020;
+static const uint16_t T_GRN = 0x07C0;
+static const uint16_t T_MID = 0x9085;
+
+static uint32_t fnv1a(const uint8_t* data, size_t len) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++) { h ^= data[i]; h *= 16777619u; }
+  return h;
+}
+
+static int findOrAlloc(uint32_t id) {
+  for (int i = 0; i < thitCount; i++) if (thits[i].id == id) return i;
+  if (thitCount == MAX_HITS) {
+    // Evict the oldest by lastSeenMs.
+    int oldest = 0;
+    for (int i = 1; i < thitCount; i++)
+      if (thits[i].lastSeenMs < thits[oldest].lastSeenMs) oldest = i;
+    return oldest;
+  }
+  return thitCount++;
+}
+
+static void appendCsv(const TpmsHit& h) {
+  if (!(SD.cardSize() > 0)) return;
+  if (!SD.exists("/captures")) SD.mkdir("/captures");
+  bool fresh = !SD.exists("/captures/tpms.csv");
+  File f = SD.open("/captures/tpms.csv", FILE_APPEND);
+  if (!f) return;
+  if (fresh) f.println("utc,date,freq_mhz,sensor_id_hex,peak_rssi");
+  char utc[10], date[10];
+  TimeSync::utcNow(utc, sizeof(utc));
+  TimeSync::utcDateNow(date, sizeof(date));
+  f.printf("%s,%s,%.3f,0x%08lX,%d\n",
+           utc, date, T_FREQS[h.freqIdx],
+           (unsigned long)h.id, (int)h.peakRssi);
+  f.close();
+}
+
+static void retuneTpms(int idx) {
+  if (idx < 0) idx = 0;
+  if (idx >= T_NUM_FREQS) idx = T_NUM_FREQS - 1;
+  tFreqIdx = idx;
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(T_FREQS[tFreqIdx]);
+  ELECHOUSE_cc1101.SetRx();
+}
+
+static void drawShellTpms() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0,   240, T_RED);
+  tft.drawFastHLine(0, 24,  240, T_DIM);
+  tft.drawFastHLine(0, 296, 240, T_DIM);
+  tft.drawFastHLine(0, 319, 240, T_RED);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(T_RED, TFT_BLACK);
+  tft.setCursor(50, 6); tft.print("[ TPMS LOGGER ]");
+  tft.setTextColor(T_DIM, TFT_BLACK);
+  tft.setCursor(8, 301); tft.print("R=band  L=clear  hold SEL=exit");
+}
+
+static void drawListTpms() {
+  tft.fillRect(0, 28, 240, 268, TFT_BLACK);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(T_GRN, TFT_BLACK);
+  tft.setCursor(8, 30);
+  char hdr[40];
+  uint32_t up = (millis() - tStartMs) / 1000;
+  snprintf(hdr, sizeof(hdr), "%.2f MHz  sensors:%d  up:%lus",
+           T_FREQS[tFreqIdx], thitCount, (unsigned long)up);
+  tft.print(hdr);
+  tft.setTextColor(T_MID, TFT_BLACK);
+  tft.setCursor(8, 46);
+  snprintf(hdr, sizeof(hdr), "bursts seen: %lu", (unsigned long)tTotalBursts);
+  tft.print(hdr);
+
+  if (thitCount == 0) {
+    tft.setTextColor(T_DIM, TFT_BLACK);
+    tft.setCursor(8, 80);
+    tft.print("// listening for TPMS bursts //");
+    tft.setCursor(8, 100);
+    tft.print("Park near a road and wait for");
+    tft.setCursor(8, 116);
+    tft.print("cars to drive past, or drive");
+    tft.setCursor(8, 132);
+    tft.print("through a parking lot. Sensors");
+    tft.setCursor(8, 148);
+    tft.print("broadcast every ~30s when moving.");
+    return;
+  }
+
+  // Sort newest-first.
+  int order[MAX_HITS];
+  for (int i = 0; i < thitCount; i++) order[i] = i;
+  for (int i = 0; i + 1 < thitCount; i++)
+    for (int j = i + 1; j < thitCount; j++)
+      if (thits[order[j]].lastSeenMs > thits[order[i]].lastSeenMs) {
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+      }
+
+  const int Y0 = 70;
+  const int rowH = 22;
+  const int maxRows = (290 - Y0) / rowH;
+  for (int r = 0; r < maxRows && r < thitCount; r++) {
+    int idx = order[r];
+    const TpmsHit& h = thits[idx];
+    int y = Y0 + r * rowH;
+    bool isSel = (r == tSel);
+    if (isSel) tft.fillRect(2, y - 2, 236, rowH, T_DIM);
+    tft.setTextColor(isSel ? WHITE : T_RED, isSel ? T_DIM : TFT_BLACK);
+    tft.setCursor(4, y);
+    char line[40];
+    snprintf(line, sizeof(line), "0x%08lX  %ddBm",
+             (unsigned long)h.id, (int)h.peakRssi);
+    tft.print(line);
+    tft.setCursor(4, y + 10);
+    tft.setTextColor(isSel ? WHITE : T_GRN, isSel ? T_DIM : TFT_BLACK);
+    uint32_t ageS = (millis() - h.lastSeenMs) / 1000;
+    snprintf(line, sizeof(line), " hits:%u  last:%lus ago",
+             (unsigned)h.hitCount, (unsigned long)ageS);
+    tft.print(line);
+  }
+}
+
+void setup() {
+  thitCount = 0; tTotalBursts = 0; tSel = 0; tScroll = 0; tUiDirty = true;
+  tStartMs = millis();
+  memset(thits, 0, sizeof(thits));
+
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  retuneTpms(tFreqIdx);
+
+  drawShellTpms();
+  drawListTpms();
+}
+
+void loop() {
+  NeoFx::tick();
+
+  // Burst detector: sample RSSI, treat a sustained-above-floor run as a burst.
+  static bool      inBurst   = false;
+  static uint32_t  burstStartMs = 0;
+  static int8_t    burstPeak    = -127;
+  static uint8_t   burstSignature[16] = {0};   // accumulated peak buckets
+  static uint8_t   burstSigLen  = 0;
+  static uint32_t  lastSampleMs = 0;
+
+  uint32_t now = millis();
+  if (now - lastSampleMs >= 1) {
+    lastSampleMs = now;
+    int rssi = ELECHOUSE_cc1101.getRssi();
+    if (!inBurst) {
+      if (rssi > BURST_RSSI_FLOOR) {
+        inBurst = true;
+        burstStartMs = now;
+        burstPeak = (int8_t)rssi;
+        burstSigLen = 0;
+        // Seed sig with the band so different bands hash to different ids.
+        burstSignature[burstSigLen++] = (uint8_t)tFreqIdx;
+      }
+    } else {
+      if ((int8_t)rssi > burstPeak) burstPeak = (int8_t)rssi;
+      // Sample peak-bucket every 4ms into the signature buffer for hashing.
+      if (((now - burstStartMs) & 0x3) == 0 && burstSigLen < sizeof(burstSignature)) {
+        burstSignature[burstSigLen++] = (uint8_t)((rssi + 110) & 0xFF);
+      }
+      if (rssi <= BURST_RSSI_FLOOR - 5 || (now - burstStartMs) > BURST_MAX_MS) {
+        uint32_t dur = now - burstStartMs;
+        if (dur >= BURST_MIN_MS && dur <= BURST_MAX_MS) {
+          tTotalBursts++;
+          uint32_t id = fnv1a(burstSignature, burstSigLen);
+          int slot = findOrAlloc(id);
+          if (slot < thitCount && thits[slot].id == id) {
+            // Existing sensor — bump.
+            if ((int8_t)rssi > thits[slot].peakRssi) thits[slot].peakRssi = burstPeak;
+            thits[slot].lastSeenMs = now;
+            thits[slot].hitCount++;
+          } else {
+            // New sensor.
+            thits[slot].id          = id;
+            thits[slot].freqIdx     = (uint8_t)tFreqIdx;
+            thits[slot].peakRssi    = burstPeak;
+            thits[slot].firstSeenMs = now;
+            thits[slot].lastSeenMs  = now;
+            thits[slot].hitCount    = 1;
+            if (slot == thitCount - 1 || thits[slot].id != 0) {
+              // (findOrAlloc may return an evicted-slot index; either way we
+              // wrote into it.)
+            }
+            appendCsv(thits[slot]);
+            NeoFx::event(NeoFx::Event::Capture);
+          }
+          tUiDirty = true;
+        }
+        inBurst = false;
+      }
+    }
+  }
+
+  // UI redraw at most every 250ms to avoid TFT thrash during bursts.
+  static uint32_t lastDrawMs = 0;
+  if (tUiDirty && (now - lastDrawMs) > 250) {
+    lastDrawMs = now;
+    tUiDirty = false;
+    drawListTpms();
+  }
+
+  // Buttons.
+  static bool lfPrev = false, rgPrev = false;
+  bool lf = !pcf.digitalRead(BTN_LEFT);
+  bool rg = !pcf.digitalRead(BTN_RIGHT);
+  if (rg && !rgPrev) { retuneTpms((tFreqIdx + 1) % T_NUM_FREQS); tUiDirty = true; lastDrawMs = 0; }
+  if (lf && !lfPrev) {
+    thitCount = 0; tTotalBursts = 0; tSel = 0;
+    memset(thits, 0, sizeof(thits));
+    tUiDirty = true; lastDrawMs = 0;
+  }
+  lfPrev = lf; rgPrev = rg;
+
+  if (isSelectHeldLong()) {
+    feature_exit_requested = true;
+    return;
+  }
+}
+
+void exit() {
+  ELECHOUSE_cc1101.setSidle();
+}
+
+}  // namespace TpmsLogger

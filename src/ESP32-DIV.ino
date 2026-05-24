@@ -78,12 +78,13 @@ const char *nrf_submenu_items[nrf_NUM_SUBMENU_ITEMS] = {
     "Proto Kill",
     "Back to Main Menu"};
 
-const int subghz_NUM_SUBMENU_ITEMS = 5;
+const int subghz_NUM_SUBMENU_ITEMS = 6;
 const char *subghz_submenu_items[subghz_NUM_SUBMENU_ITEMS] = {
     "Replay Attack",
     "SubGHz Jammer",
     "Saved Profile",
     "RF Decoder",
+    "TPMS Logger",
     "Back to Main Menu"};
 
 const int tools_NUM_SUBMENU_ITEMS = 7;
@@ -187,6 +188,7 @@ const unsigned char *subghz_submenu_icons[subghz_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_no_signal,
     bitmap_icon_list,
     bitmap_icon_eye2,       // RF Decoder
+    bitmap_icon_satellite,  // TPMS Logger (cars/wheels theme — reuse satellite)
     bitmap_icon_go_back
 };
 
@@ -1979,13 +1981,38 @@ void handleSubGHzSubmenuButtons() {
         last_interaction_time = millis();
         delay(200);
 
-        if (current_submenu_index == 4) {
+        if (current_submenu_index == 5) {
             in_sub_menu = false;
             feature_active = false;
             feature_exit_requested = false;
             displayMenu();
             handleButtons();
             is_main_menu = false;
+        }
+
+        if (current_submenu_index == 4) {
+            // TPMS Logger
+            current_submenu_index = 4;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            TpmsLogger::setup();
+            while (current_submenu_index == 4 && !feature_exit_requested) {
+                current_submenu_index = 4;
+                in_sub_menu = true;
+                TpmsLogger::loop();
+            }
+            TpmsLogger::exit();
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
+            }
+            return;
         }
 
         if (current_submenu_index == 3) {
@@ -2139,13 +2166,36 @@ void handleSubGHzSubmenuButtons() {
                 displaySubmenu();
                 delay(200);
 
-                if (current_submenu_index == 4) {
+                if (current_submenu_index == 5) {
                     in_sub_menu = false;
                     feature_active = false;
                     feature_exit_requested = false;
                     displayMenu();
                     handleButtons();
                     is_main_menu = false;
+
+                } else if (current_submenu_index == 4) {
+                    // TPMS Logger
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    TpmsLogger::setup();
+                    while (current_submenu_index == 4 && !feature_exit_requested) {
+                        current_submenu_index = 4;
+                        in_sub_menu = true;
+                        TpmsLogger::loop();
+                    }
+                    TpmsLogger::exit();
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                    return;
 
                 } else if (current_submenu_index == 3) {
                     // RF Decoder
