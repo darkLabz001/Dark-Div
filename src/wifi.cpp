@@ -2445,7 +2445,7 @@ void wifiscanLoop() {
 
   // Attack popup takes input precedence over the normal list.
   if (attackMenuOpen) {
-    if (isButtonPressed(BTN_SELECT)) {
+    if (isSelectHeldLong()) {
       // Long-hold SELECT closes the popup without firing.
       attackMenuOpen = false;
       while (isButtonPressed(BTN_SELECT)) delay(20);
@@ -2483,7 +2483,9 @@ void wifiscanLoop() {
     return;
   }
 
-  if (feature_active && isButtonPressed(BTN_SELECT)) {
+  // Long-hold SELECT exits the feature (short tap is reserved for opening
+  // the attack menu on the current row, below).
+  if (feature_active && isSelectHeldLong()) {
     feature_exit_requested = true;
     return;
   }
@@ -7020,7 +7022,7 @@ void run() {
       WiFi.scanDelete();
       return;
     }
-    if (isButtonPressed(BTN_SELECT)) {
+    if (isSelectHeldLong()) {
       drainSelect();
       WiFi.scanDelete();
       return;

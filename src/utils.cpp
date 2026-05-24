@@ -1832,9 +1832,9 @@ void loop(){
   bool rightNow  = isButtonPressed(BTN_RIGHT);
   bool selectNow = isButtonPressed(BTN_SELECT);
 
-  // SELECT semantics now: short tap = confirm (handled here), long hold =
-  // exit (the `selectNow` branch below, since isButtonPressed(BTN_SELECT)
-  // only latches true after SELECT_HOLD_MS).
+  // SELECT semantics: short tap = confirm/cycle (handled here), long hold = exit.
+  // We deliberately ignore the raw `selectNow` press edge for Settings, since
+  // every short tap is supposed to act on the highlighted row.
   if (isSelectShortTapped() && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
     if (sel == WIFI_ROW) {
       WifiSetup::run();
@@ -1859,12 +1859,15 @@ void loop(){
     changedByButtons = true;
     lastActionMs     = now;
   }
-  if (selectNow && !selectWasDown && (now - lastActionMs > ACTION_DEBOUNCE_MS)) {
+  if (isSelectHeldLong()) {
     // Long-hold SELECT → exit Settings.
     feature_exit_requested = true;
     lastActionMs = now;
     return;
   }
+  // Suppress the legacy raw-edge handling for SELECT in Settings.
+  (void)selectNow;
+  (void)selectWasDown;
 
   if (upNow && !upWasDown && (now - lastNavMs > NAV_DEBOUNCE_MS)) {
     sel=(sel+N-1)%N; changedByButtons=true;

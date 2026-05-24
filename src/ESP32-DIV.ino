@@ -304,15 +304,18 @@ void updateActiveSubmenu() {
     }
 }
 
-// BTN_SELECT gets press-vs-hold semantics: short tap = confirm (signalled
-// via isSelectShortTapped() below), long hold = "pressed" (latched true
-// after SELECT_HOLD_MS, stays true until release). This keeps every legacy
-// "if (isButtonPressed(BTN_SELECT)) exit" call site working — they now
-// require a long hold to fire.
+// BTN_SELECT semantics:
+//   - isButtonPressed(BTN_SELECT)  : raw press (matches every legacy site —
+//                                    short tap is enough to exit a feature).
+//   - isSelectShortTapped()        : fires once on release if held < SELECT_HOLD_MS.
+//   - isSelectHeldLong()           : fires once when raw has been held ≥ SELECT_HOLD_MS.
+// Settings + WifiSetup deliberately ignore the raw press and only use the two
+// helpers, so a tap = confirm while a hold = back. Everywhere else, raw press
+// still exits the feature — which is the muscle memory the user expects.
 static constexpr uint32_t SELECT_HOLD_MS = 600;
 static uint32_t s_selectPressedSinceMs = 0;
-static bool     s_selectLongLatched    = false;
-static bool     s_selectShortPending   = false;   // armed on release if short
+static bool     s_selectLongFired      = false;
+static bool     s_selectShortPending   = false;
 
 bool isButtonPressed(int buttonPin) {
   bool raw = !pcf.digitalRead(buttonPin);
@@ -321,28 +324,38 @@ bool isButtonPressed(int buttonPin) {
   uint32_t now = millis();
   if (raw) {
     if (s_selectPressedSinceMs == 0) s_selectPressedSinceMs = now;
-    if (!s_selectLongLatched && (now - s_selectPressedSinceMs) >= SELECT_HOLD_MS) {
-      s_selectLongLatched  = true;
-      s_selectShortPending = false;   // already crossed long threshold
+    if (!s_selectLongFired && (now - s_selectPressedSinceMs) >= SELECT_HOLD_MS) {
+      s_selectLongFired = true;     // long-hold edge — consumed by isSelectHeldLong
     }
-    return s_selectLongLatched;
   } else {
-    if (s_selectPressedSinceMs != 0 && !s_selectLongLatched) {
-      // Released before the long-hold threshold — arm a short-tap event.
-      s_selectShortPending = true;
+    if (s_selectPressedSinceMs != 0 && !s_selectLongFired) {
+      s_selectShortPending = true;  // armed for isSelectShortTapped
     }
     s_selectPressedSinceMs = 0;
-    s_selectLongLatched    = false;
-    return false;
+    s_selectLongFired      = false;
   }
+  return raw;
 }
 
-// True exactly once after a short SELECT press is released (< SELECT_HOLD_MS).
-// Consumed by the call; subsequent calls return false until the next short tap.
 bool isSelectShortTapped() {
   if (s_selectShortPending) {
     s_selectShortPending = false;
     return true;
+  }
+  return false;
+}
+
+bool isSelectHeldLong() {
+  // True once when the long-hold threshold is first crossed. Caller is
+  // responsible for waiting for release if it cares about debounce.
+  if (s_selectLongFired) {
+    // Latch a per-press one-shot by clearing the press-since marker — keeps
+    // returning false until the next press/release cycle.
+    static uint32_t lastFiredAtMs = 0;
+    if (s_selectPressedSinceMs != 0 && s_selectPressedSinceMs != lastFiredAtMs) {
+      lastFiredAtMs = s_selectPressedSinceMs;
+      return true;
+    }
   }
   return false;
 }

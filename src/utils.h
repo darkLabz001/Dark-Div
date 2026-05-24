@@ -32,10 +32,16 @@ extern bool feature_exit_requested;
 
 extern void setBrightness(uint8_t value);
 bool isButtonPressed(int buttonPin);
-/* BTN_SELECT only: returns true once after a short tap (released before the
- * long-hold threshold). Long holds suppress this — isButtonPressed(BTN_SELECT)
- * returns true on the long-hold latch instead. Call once per loop. */
+/* BTN_SELECT helpers (orthogonal to isButtonPressed, which always returns the
+ * raw level). Call at most once per loop iteration each.
+ *
+ *   isSelectShortTapped() — true once on release if held < SELECT_HOLD_MS
+ *   isSelectHeldLong()    — true once when the press first crosses SELECT_HOLD_MS
+ *
+ * Use these in features that want a tap-vs-hold split (Settings, pickers).
+ * Features that just want "press = exit" can keep using isButtonPressed. */
 bool isSelectShortTapped();
+bool isSelectHeldLong();
 
 extern float currentBatteryVoltage;
 
