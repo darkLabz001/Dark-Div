@@ -2459,10 +2459,35 @@ void loop() {
   }
   upPrev = up; dnPrev = dn; lfPrev = lf; rgPrev = rg;
 
-  // Detail-view state machine. Detail view stays open until LEFT (back to
-  // list) — long-hold SELECT bypasses detail and exits the feature outright.
+  // Local SELECT state machine — purely owned by this feature, no dependency
+  // on the shared isSelect*Tapped helpers (which the user reports drifting).
+  // Release < 350 ms = short tap; press held > 600 ms = exit.
+  static uint32_t selPressedAt = 0;
+  static bool     selWasRaw    = false;
+  static bool     shortTapFired = false;
+  static bool     longHoldFired = false;
+
+  bool selRaw = !pcf.digitalRead(BTN_SELECT);
+  uint32_t nowMs = millis();
+  shortTapFired = false;
+  if (selRaw && !selWasRaw) {
+    selPressedAt = nowMs;
+    longHoldFired = false;
+  } else if (!selRaw && selWasRaw) {
+    uint32_t held = nowMs - selPressedAt;
+    if (held < 350 && !longHoldFired) shortTapFired = true;
+    selPressedAt = 0;
+  } else if (selRaw && !longHoldFired && (nowMs - selPressedAt) > 600) {
+    longHoldFired = true;
+    feature_exit_requested = true;
+    selWasRaw = selRaw;
+    return;
+  }
+  selWasRaw = selRaw;
+
+  // Detail-view state machine.
   static int detailIdx = -1;
-  if (isSelectShortTapped() && pktCount > 0 && detailIdx < 0) {
+  if (shortTapFired && pktCount > 0 && detailIdx < 0) {
     detailIdx = pktCount - 1 - selIndex;
     if (detailIdx >= 0 && detailIdx < pktCount) {
       drawDetail(packets[detailIdx]);
@@ -2472,7 +2497,6 @@ void loop() {
   }
 
   if (detailIdx >= 0) {
-    // Detail view active. LEFT = back to list, SEL hold = exit feature.
     static bool lfPrevD = false;
     bool lf = !pcf.digitalRead(BTN_LEFT);
     if (lf && !lfPrevD) {
@@ -2480,13 +2504,7 @@ void loop() {
       NeoFx::event(NeoFx::Event::Capture);
     }
     lfPrevD = lf;
-    if (isSelectHeldLong()) {
-      feature_exit_requested = true;
-      detailIdx = -1;
-      return;
-    }
-    // Tap SEL again = close detail, back to list.
-    if (isSelectShortTapped()) {
+    if (shortTapFired && !uiDirty) {       // tap again = close detail
       detailIdx = -1;
       drawShell();
       drawHeader();
@@ -2500,12 +2518,6 @@ void loop() {
     drawHeader();
     drawList();
     uiDirty = false;
-  }
-
-  // Long-hold SELECT exits the feature.
-  if (isSelectHeldLong()) {
-    feature_exit_requested = true;
-    return;
   }
 
   delay(15);
@@ -2782,10 +2794,22 @@ void loop() {
   }
   lfPrev = lf; rgPrev = rg;
 
-  if (isSelectHeldLong()) {
+  // Local long-hold-SELECT exit — bypass the global helpers which were
+  // dropping the event in this feature.
+  static uint32_t tSelPressedAt = 0;
+  static bool     tSelWasRaw    = false;
+  bool tSelRaw = !pcf.digitalRead(BTN_SELECT);
+  uint32_t tNow = millis();
+  if (tSelRaw && !tSelWasRaw) {
+    tSelPressedAt = tNow;
+  } else if (tSelRaw && (tNow - tSelPressedAt) > 600) {
     feature_exit_requested = true;
+    tSelWasRaw = tSelRaw;
     return;
+  } else if (!tSelRaw) {
+    tSelPressedAt = 0;
   }
+  tSelWasRaw = tSelRaw;
 }
 
 void exit() {
