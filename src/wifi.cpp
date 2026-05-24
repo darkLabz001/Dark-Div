@@ -8884,10 +8884,31 @@ static bool fetchMessages() {
   // can satisfy from internal heap), then use a Filter so the parser only
   // retains 4 fields per object — the resulting doc fits in ~4 KB even with
   // 200+ messages. Avoids the 48 KB contiguous allocation that NoMemory'd.
+  //
+  // Manual stream read: HTTPClient::getString() returns "" when the response
+  // is chunked transfer-encoded (which Cloudflare uses for /api/chat). Pull
+  // bytes ourselves until the stream is idle.
   int contentLen = https.getSize();
   String body;
-  if (contentLen > 0) body.reserve(contentLen + 64);
-  body = https.getString();
+  body.reserve(contentLen > 0 ? (contentLen + 64) : (12 * 1024));
+
+  WiFiClient* stream = https.getStreamPtr();
+  uint32_t lastByteMs = millis();
+  const uint32_t IDLE_TIMEOUT_MS = 1500;
+  while (true) {
+    int avail = stream ? stream->available() : 0;
+    while (avail > 0) {
+      uint8_t buf[256];
+      int want = avail > (int)sizeof(buf) ? (int)sizeof(buf) : avail;
+      int got = stream->readBytes(buf, want);
+      for (int i = 0; i < got; i++) body += (char)buf[i];
+      avail -= got;
+      lastByteMs = millis();
+    }
+    if ((millis() - lastByteMs) > IDLE_TIMEOUT_MS) break;
+    if (!https.connected() && (!stream || stream->available() == 0)) break;
+    delay(4);
+  }
   https.end();
 
   // Trim leading whitespace / BOM so a Cloudflare wrapper byte doesn't
