@@ -189,6 +189,75 @@ static bool saveCurrent() {
   return true;
 }
 
+// --- Recovery confirmation screen ------------------------------------------
+// Shows the user what they're about to do and the exact esptool command to
+// reflash Dark-Div if the foreign firmware turns out to be a one-way trip.
+// Short SELECT tap = proceed; LEFT or hold SELECT = cancel.
+static bool confirmFlash(const AppEntry& a) {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0,   240, L_RED);
+  tft.drawFastHLine(0, 24,  240, L_DIM);
+  tft.drawFastHLine(0, 296, 240, L_DIM);
+  tft.drawFastHLine(0, 319, 240, L_RED);
+
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(L_RED, TFT_BLACK);
+  tft.setCursor(54, 6); tft.print("[ CONFIRM FLASH ]");
+
+  tft.setCursor(8, 34);
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.print("About to boot:");
+  tft.setCursor(8, 54);
+  tft.setTextColor(L_RED, TFT_BLACK);
+  tft.print(a.name);
+
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(L_DIM, TFT_BLACK);
+  tft.setCursor(8, 86);
+  tft.print("Once flashed, the only ways back to");
+  tft.setCursor(8, 98);
+  tft.print("Dark-Div are:");
+  tft.setCursor(8, 116);
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.print("- the foreign firmware's update menu");
+  tft.setCursor(8, 128);
+  tft.print("- PC + esptool over USB:");
+  tft.setCursor(14, 148);
+  tft.setTextColor(L_GRN, TFT_BLACK);
+  tft.print("esptool --chip esp32s3 --port");
+  tft.setCursor(14, 160);
+  tft.print("  /dev/ttyACM0 erase_region 0xE000");
+  tft.setCursor(14, 172);
+  tft.print("  0x2000 && esptool ... write_flash");
+  tft.setCursor(14, 184);
+  tft.print("  0x10000 dark-div.bin");
+
+  tft.setCursor(8, 216);
+  tft.setTextColor(L_DIM, TFT_BLACK);
+  tft.print("A copy of the running Dark-Div has");
+  tft.setCursor(8, 228);
+  tft.print("been saved to /apps/dark-div.bin so");
+  tft.setCursor(8, 240);
+  tft.print("you have a backup on the SD card.");
+
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(L_RED, TFT_BLACK);
+  tft.setCursor(8, 270);
+  tft.print("SEL=flash   LEFT/hold=cancel");
+
+  // Wait for input. Reuse helpers from main loop.
+  static bool lfPrev = false, upPrev = false;
+  for (;;) {
+    bool lf = !pcf.digitalRead(BTN_LEFT);
+    if (lf && !lfPrev) return false;
+    lfPrev = lf;
+    if (isSelectShortTapped()) return true;
+    if (isSelectHeldLong())    return false;
+    NeoFx::tick();
+    delay(15);
+  }
+}
+
 // --- Flash + reboot --------------------------------------------------------
 static void flashAndReboot(int idx) {
   if (idx < 0 || idx >= appCount) return;
@@ -205,6 +274,22 @@ static void flashAndReboot(int idx) {
     snprintf(msg, sizeof(msg), "bad magic 0x%02X (not ESP32 .bin)", first & 0xFF);
     status(msg, L_RED);
     delay(2500);
+    return;
+  }
+
+  // Refuse to flash if /apps/dark-div.bin doesn't exist — without that backup
+  // there's no way back from a foreign firmware that lacks its own update flow.
+  if (!SD.exists("/apps/dark-div.bin")) {
+    f.close();
+    status("save dark-div first (LEFT)", L_RED);
+    delay(2500);
+    return;
+  }
+
+  if (!confirmFlash(a)) {
+    f.close();
+    drawShell();
+    drawList();
     return;
   }
 
@@ -276,6 +361,21 @@ void setup() {
   scroll   = 0;
   uiDirty  = true;
   drawShell();
+
+  // Auto-save the running Dark-Div firmware to /apps/dark-div.bin on first
+  // entry, so the user always has a backup on SD they can flash back to.
+  // (Foreign firmwares like Marauder won't have a "go back" feature.)
+  if (isSDCardAvailable() && !SD.exists("/apps/dark-div.bin")) {
+    status("first-run: saving backup...", L_DIM);
+    if (saveCurrent()) {
+      status("saved /apps/dark-div.bin", L_GRN);
+      delay(800);
+    } else {
+      status("backup save failed", L_RED);
+      delay(1500);
+    }
+  }
+
   status("scanning SD...", L_DIM);
   scanApps();
   drawList();
