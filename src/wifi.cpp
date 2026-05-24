@@ -8640,7 +8640,7 @@ static bool     wifiUp      = false;
 static bool     uiDirty     = true;
 static uint32_t lastPollMs  = 0;
 static uint32_t lastSentMs  = 0;
-static char     lastErr[40] = {0};
+static char     lastErr[80] = {0};
 
 static const uint16_t CH_RED  = 0xE0E6;
 static const uint16_t CH_DIM  = 0x6020;
@@ -8877,30 +8877,40 @@ static bool fetchMessages() {
     return false;
   }
 
-  // The internal SRAM heap gets fragmented; even with 100+ KB free total, a
-  // single contiguous 48 KB doc allocation fails ("NoMemory"). Route the doc
-  // to PSRAM (board has it; see [[esp32-div-flashing]]/platformio.ini).
-  struct PsramAlloc {
-    void* allocate(size_t size)      { return ps_malloc(size); }
-    void  deallocate(void* p)        { free(p); }
-    void* reallocate(void* p, size_t s) { return ps_realloc(p, s); }
-  };
-  using PsramJsonDoc = BasicJsonDocument<PsramAlloc>;
-
-  PsramJsonDoc doc(64 * 1024);
-  WiFiClient* stream = https.getStreamPtr();
-  DeserializationError err = deserializeJson(doc, *stream);
+  // Strategy: pull the body to a String (one ~10 KB allocation that String
+  // can satisfy from internal heap), then use a Filter so the parser only
+  // retains 4 fields per object — the resulting doc fits in ~4 KB even with
+  // 200+ messages. Avoids the 48 KB contiguous allocation that NoMemory'd.
+  int contentLen = https.getSize();
+  String body;
+  if (contentLen > 0) body.reserve(contentLen + 64);
+  body = https.getString();
   https.end();
+
+  // Filter: keep only the four fields we render. v6 wants ~16 B + key length
+  // per filter entry; 256 B is plenty.
+  StaticJsonDocument<256> filter;
+  filter[0]["id"]         = true;
+  filter[0]["username"]   = true;
+  filter[0]["message"]    = true;
+  filter[0]["created_at"] = true;
+
+  DynamicJsonDocument doc(8 * 1024);
+  DeserializationError err = deserializeJson(
+      doc, body, DeserializationOption::Filter(filter));
   if (err) {
-    snprintf(lastErr, sizeof(lastErr), "json: %s heap=%u psram=%u",
+    snprintf(lastErr, sizeof(lastErr),
+             "json:%s bodyLen=%u heap=%u psram=%u",
              err.c_str(),
+             (unsigned)body.length(),
              (unsigned)ESP.getFreeHeap(),
              (unsigned)ESP.getFreePsram());
     return false;
   }
 
   if (!doc.is<JsonArray>()) {
-    snprintf(lastErr, sizeof(lastErr), "json: not array");
+    snprintf(lastErr, sizeof(lastErr),
+             "json: not array (bodyLen=%u)", (unsigned)body.length());
     return false;
   }
 
@@ -8917,7 +8927,9 @@ static bool fetchMessages() {
     added++;
   }
   if (added > 0) { msgScroll = 0; uiDirty = true; }
-  snprintf(lastErr, sizeof(lastErr), "ok: %d seen / %d new", seen, added);
+  snprintf(lastErr, sizeof(lastErr),
+           "ok: %d seen / %d new (heap=%uk)",
+           seen, added, (unsigned)(ESP.getFreeHeap() / 1024));
   uiDirty = true;
   return true;
 }
