@@ -85,13 +85,14 @@ const char *subghz_submenu_items[subghz_NUM_SUBMENU_ITEMS] = {
     "Saved Profile",
     "Back to Main Menu"};
 
-const int tools_NUM_SUBMENU_ITEMS = 6;
+const int tools_NUM_SUBMENU_ITEMS = 7;
 const char *tools_submenu_items[tools_NUM_SUBMENU_ITEMS] = {
     "Serial Monitor",
     "Update Firmware",
     "Touch Calibrate",
     "SD File Manager",
     "Web Dashboard",
+    "App Launcher",
     "Back to Main Menu"};
 
 static constexpr uint8_t OTHER_LAYER_HOME = 0;
@@ -193,6 +194,7 @@ const unsigned char *tools_submenu_icons[tools_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_undo,
     bitmap_icon_sdcard,
     bitmap_icon_wifi,
+    bitmap_icon_eye2,        // App Launcher
     bitmap_icon_go_back
 };
 
@@ -2229,8 +2231,9 @@ constexpr int TOOLS_IDX_UPDATE    = 1;
 constexpr int TOOLS_IDX_TOUCH     = 2;
 constexpr int TOOLS_IDX_SD_FILES  = 3;
 constexpr int TOOLS_IDX_DASHBOARD = 4;
+constexpr int TOOLS_IDX_LAUNCHER  = 5;
 constexpr int TOOLS_IDX_SETTINGS  = -1;
-constexpr int TOOLS_IDX_BACK      = 5;
+constexpr int TOOLS_IDX_BACK      = 6;
 
 void handleToolsSubmenuButtons() {
     if (isButtonPressed(BTN_UP)) {
@@ -2409,6 +2412,30 @@ void handleToolsSubmenuButtons() {
                 WebDashboard::loop();
             }
             WebDashboard::exit();
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
+            }
+            return;
+        }
+
+        if (current_submenu_index == TOOLS_IDX_LAUNCHER) {
+            current_submenu_index = TOOLS_IDX_LAUNCHER;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            AppLauncher::setup();
+            while (current_submenu_index == TOOLS_IDX_LAUNCHER && !feature_exit_requested) {
+                current_submenu_index = TOOLS_IDX_LAUNCHER;
+                in_sub_menu = true;
+                AppLauncher::loop();
+            }
+            AppLauncher::exit();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;

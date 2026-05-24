@@ -154,6 +154,16 @@ namespace WifiSetup {
   // attempts a connection. Credentials are shared with OtaGithub::run().
   void run();
 }
+namespace AppLauncher {
+  // Multi-firmware boot menu — lists /apps/*.bin on SD, flashes the chosen
+  // one via the Arduino Update library, and reboots into it. Standard
+  // ESP32 .bin format (same as m5launcher / Bruce / Marauder use). LEFT
+  // saves the currently-running Dark-Div firmware to /apps/dark-div.bin
+  // so the user can always flash back.
+  void setup();
+  void loop();
+  void exit();
+}
 namespace WebDashboard {
   // Small HTTP server on port 80 serving a single-page web UI plus JSON API
   // endpoints (status, pwn state, captures browser, SD browser, downloads).
