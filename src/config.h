@@ -97,6 +97,14 @@ namespace subjammer {
   void subjammerSetup();
   void subjammerLoop();
 }
+namespace RfDecoder {
+  // Sub-GHz protocol decoder + fob analyzer. Listens via CC1101 + RCSwitch,
+  // shows decoded packets, classifies replay-vulnerability of captured remotes,
+  // logs to /captures/rf.csv. See subghz.cpp for protocol coverage.
+  void setup();
+  void loop();
+  void exit();
+}
 
 /* ───────────── WiFi namespaces ───────────── */
 namespace PacketMonitor {

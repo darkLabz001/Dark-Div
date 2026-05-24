@@ -2152,3 +2152,350 @@ void subjammerLoop() {
       }
   }
 }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   RfDecoder — sub-GHz protocol decoder + key-fob analyzer.
+
+   Passively listens on the CC1101 with RCSwitch attached to GDO0. Each
+   decoded packet shows: frequency, RCSwitch protocol #, payload value,
+   bit length, RSSI, and a replay-safety verdict (FIXED CODE = vulnerable
+   to capture/replay; absence of decode + strong RSSI = likely rolling
+   code / Manchester / proprietary).
+
+   Covers EV1527, PT2240, HT12, Holtek HT6P20B, SC2262, and the other
+   RCSwitch built-in protocols out of the box. Rolling-code protocols
+   like KeeLoq / HCS200 produce no RCSwitch decode and get classified
+   as ROLLING by absence + RSSI heuristic.
+
+   Controls:
+     UP/DOWN  — scroll history
+     RIGHT    — cycle frequency (315 / 433.92 / 868 MHz)
+     LEFT     — save selected packet to /captures/rf.csv
+     SEL tap  — drill into highlighted packet (full details + verdict)
+     SEL hold — back to menu
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace RfDecoder {
+
+static constexpr int    MAX_PACKETS = 32;
+static constexpr float  FREQS[]     = { 315.0f, 433.92f, 868.35f };
+static constexpr int    NUM_FREQS   = sizeof(FREQS) / sizeof(FREQS[0]);
+
+struct Packet {
+  uint32_t value;
+  uint16_t bits;
+  uint8_t  protocol;
+  uint32_t delayUs;
+  int8_t   rssi;
+  uint8_t  freqIdx;
+  uint32_t ageMs;
+};
+
+static Packet  packets[MAX_PACKETS];
+static int     pktCount = 0;
+static int     selIndex = 0;
+static int     scroll   = 0;
+static int     freqIdx  = 1;        // start at 433.92 MHz (the most common)
+static bool    uiDirty  = true;
+static uint32_t startMs = 0;
+static uint32_t totalDecoded = 0;
+static uint32_t lastSeenStrongMs = 0;
+static int8_t   lastNoDecodeRssi = -127;
+
+static RCSwitch s_sw = RCSwitch();
+
+static const uint16_t R_RED = 0xE0E6;
+static const uint16_t R_DIM = 0x6020;
+static const uint16_t R_GRN = 0x07C0;
+static const uint16_t R_MID = 0x9085;
+
+// ── Verdicts ────────────────────────────────────────────────────────────────
+struct Verdict {
+  const char* label;     // e.g. "EV1527"
+  const char* note;      // short usage note
+  bool        replayWorks;
+};
+
+static Verdict classify(const Packet& p) {
+  // RCSwitch numbers protocols 1..N. Standard ones map to common families.
+  switch (p.protocol) {
+    case 1:
+      if (p.bits == 24) return { "EV1527 / PT2240", "consumer gate/garage remote", true };
+      if (p.bits == 32) return { "Protocol 1 (32b)", "extended fixed code", true };
+      return { "Protocol 1", "fixed code", true };
+    case 2:
+      return { "Protocol 2 (HT6P20B)", "Holtek encoder, fixed", true };
+    case 3:
+      return { "Protocol 3", "Sumtech-style fixed code", true };
+    case 4:
+      return { "Protocol 4", "fixed code", true };
+    case 5:
+      return { "Protocol 5", "fixed code", true };
+    case 6:
+      return { "Protocol 6", "fixed code", true };
+    case 7:
+      return { "Protocol 7", "fixed code (HT12)", true };
+    case 11:
+      return { "Protocol 11", "remote (fixed)", true };
+    case 12:
+      return { "Protocol 12", "remote (fixed)", true };
+    default:
+      return { "Unknown", "fixed-code variant", true };
+  }
+}
+
+// ── CC1101 setup ────────────────────────────────────────────────────────────
+static void retune(int idx) {
+  if (idx < 0) idx = 0;
+  if (idx >= NUM_FREQS) idx = NUM_FREQS - 1;
+  freqIdx = idx;
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setMHZ(FREQS[freqIdx]);
+  ELECHOUSE_cc1101.SetRx();
+}
+
+// ── UI ──────────────────────────────────────────────────────────────────────
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0,   240, R_RED);
+  tft.drawFastHLine(0, 24,  240, R_DIM);
+  tft.drawFastHLine(0, 296, 240, R_DIM);
+  tft.drawFastHLine(0, 319, 240, R_RED);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(R_RED, TFT_BLACK);
+  tft.setCursor(50, 6); tft.print("[ RF DECODER ]");
+  tft.setTextColor(R_DIM, TFT_BLACK);
+  tft.setCursor(8, 301); tft.print("UP/DN  R=freq  L=save  SEL=info");
+}
+
+static void drawHeader() {
+  tft.fillRect(0, 28, 240, 22, TFT_BLACK);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(R_GRN, TFT_BLACK);
+  tft.setCursor(8, 30);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%.2f MHz", FREQS[freqIdx]);
+  tft.print(buf);
+  tft.setTextColor(R_MID, TFT_BLACK);
+  tft.setCursor(100, 30);
+  snprintf(buf, sizeof(buf), "rx:%lu  rssi:%d",
+           (unsigned long)totalDecoded,
+           (int)lastNoDecodeRssi);
+  tft.print(buf);
+}
+
+static void drawList() {
+  tft.fillRect(0, 52, 240, 244, TFT_BLACK);
+  if (pktCount == 0) {
+    tft.setTextFont(2);
+    tft.setTextColor(R_DIM, TFT_BLACK);
+    tft.setCursor(20, 140);
+    tft.print("// listening... //");
+    tft.setCursor(20, 160);
+    tft.print("press a remote near the");
+    tft.setCursor(20, 176);
+    tft.print("board on this band");
+    return;
+  }
+  // Newest first.
+  const int Y0 = 56;
+  const int rowH = 22;
+  const int maxRows = (290 - Y0) / rowH;
+  int start = scroll;
+  if (selIndex < start) start = selIndex;
+  if (selIndex >= start + maxRows) start = selIndex - maxRows + 1;
+  if (start < 0) start = 0;
+  scroll = start;
+
+  for (int r = 0; r < maxRows && (start + r) < pktCount; r++) {
+    int idx = pktCount - 1 - (start + r);   // newest at top
+    if (idx < 0) break;
+    const Packet& p = packets[idx];
+    int y = Y0 + r * rowH;
+    bool isSel = ((start + r) == selIndex);
+    if (isSel) tft.fillRect(2, y - 2, 236, rowH, R_DIM);
+    tft.setTextFont(2); tft.setTextSize(1);
+    tft.setTextColor(isSel ? WHITE : R_RED, isSel ? R_DIM : TFT_BLACK);
+    tft.setCursor(4, y);
+    char line[48];
+    snprintf(line, sizeof(line), "%.2fM p%u b%u",
+             FREQS[p.freqIdx], (unsigned)p.protocol, (unsigned)p.bits);
+    tft.print(line);
+    tft.setCursor(4, y + 10);
+    tft.setTextColor(isSel ? WHITE : R_GRN, isSel ? R_DIM : TFT_BLACK);
+    char val[24];
+    snprintf(val, sizeof(val), " 0x%08lX  %ddBm", (unsigned long)p.value, (int)p.rssi);
+    tft.print(val);
+  }
+}
+
+static void drawDetail(const Packet& p) {
+  Verdict v = classify(p);
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0,   240, R_RED);
+  tft.drawFastHLine(0, 24,  240, R_DIM);
+  tft.drawFastHLine(0, 296, 240, R_DIM);
+  tft.drawFastHLine(0, 319, 240, R_RED);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(R_RED, TFT_BLACK);
+  tft.setCursor(50, 6); tft.print("[ FOB ANALYZER ]");
+
+  tft.setTextColor(R_GRN, TFT_BLACK);
+  tft.setCursor(8, 36); tft.print(v.label);
+
+  tft.setTextColor(WHITE, TFT_BLACK);
+  char buf[64];
+  int y = 60;
+  snprintf(buf, sizeof(buf), "Freq:    %.3f MHz", FREQS[p.freqIdx]); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "Protocol: %u (RCSwitch)", (unsigned)p.protocol); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "Value:    0x%08lX", (unsigned long)p.value); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "Decimal:  %lu", (unsigned long)p.value); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "Bits:     %u", (unsigned)p.bits); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "Pulse:    %lu us", (unsigned long)p.delayUs); tft.setCursor(8, y); tft.print(buf); y += 18;
+  snprintf(buf, sizeof(buf), "RSSI:     %d dBm", (int)p.rssi); tft.setCursor(8, y); tft.print(buf); y += 28;
+
+  tft.setTextColor(v.replayWorks ? R_GRN : R_DIM, TFT_BLACK);
+  tft.setCursor(8, y);
+  tft.print(v.replayWorks ? "REPLAY: works" : "REPLAY: rolling/unknown");
+  y += 18;
+  tft.setTextColor(R_MID, TFT_BLACK);
+  tft.setCursor(8, y);
+  tft.print(v.note);
+
+  tft.setTextColor(R_DIM, TFT_BLACK);
+  tft.setCursor(8, 301); tft.print("hold SEL=back  L=save");
+}
+
+// ── SD log ──────────────────────────────────────────────────────────────────
+static void appendCsv(const Packet& p) {
+  if (!(SD.cardSize() > 0)) return;
+  if (!SD.exists("/captures")) SD.mkdir("/captures");
+  bool fresh = !SD.exists("/captures/rf.csv");
+  File f = SD.open("/captures/rf.csv", FILE_APPEND);
+  if (!f) return;
+  if (fresh) f.println("freq_mhz,protocol,bits,value_hex,delay_us,rssi");
+  f.printf("%.3f,%u,%u,0x%08lX,%lu,%d\n",
+           FREQS[p.freqIdx], (unsigned)p.protocol, (unsigned)p.bits,
+           (unsigned long)p.value, (unsigned long)p.delayUs, (int)p.rssi);
+  f.close();
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────────────────
+void setup() {
+  pktCount = 0;
+  selIndex = 0;
+  scroll   = 0;
+  uiDirty  = true;
+  totalDecoded = 0;
+  lastNoDecodeRssi = -127;
+  startMs  = millis();
+
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  retune(freqIdx);
+  s_sw.disableTransmit();
+  s_sw.enableReceive(digitalPinToInterrupt(CC1101_GDO0));
+
+  drawShell();
+  drawHeader();
+  drawList();
+}
+
+void loop() {
+  NeoFx::tick();
+
+  // Poll RCSwitch.
+  if (s_sw.available()) {
+    uint32_t value    = s_sw.getReceivedValue();
+    uint16_t bits     = s_sw.getReceivedBitlength();
+    uint8_t  proto    = s_sw.getReceivedProtocol();
+    uint32_t delayUs  = s_sw.getReceivedDelay();
+    int      rssi     = ELECHOUSE_cc1101.getRssi();
+    s_sw.resetAvailable();
+
+    if (value != 0 && bits > 0) {
+      Packet p;
+      p.value    = value;
+      p.bits     = bits;
+      p.protocol = proto;
+      p.delayUs  = delayUs;
+      p.rssi     = (int8_t)rssi;
+      p.freqIdx  = (uint8_t)freqIdx;
+      p.ageMs    = millis();
+
+      // Append (ring-buffer eviction on overflow).
+      if (pktCount == MAX_PACKETS) {
+        for (int i = 0; i < MAX_PACKETS - 1; i++) packets[i] = packets[i + 1];
+        pktCount--;
+      }
+      packets[pktCount++] = p;
+      totalDecoded++;
+      NeoFx::event(NeoFx::Event::Capture);
+      uiDirty = true;
+    }
+  }
+
+  // Track the noise floor for the "rolling code / unknown" hint.
+  static uint32_t lastRssiPollMs = 0;
+  if ((millis() - lastRssiPollMs) > 300) {
+    lastRssiPollMs = millis();
+    lastNoDecodeRssi = (int8_t)ELECHOUSE_cc1101.getRssi();
+  }
+
+  // Buttons.
+  static bool upPrev=false, dnPrev=false, lfPrev=false, rgPrev=false;
+  bool up = !pcf.digitalRead(BTN_UP);
+  bool dn = !pcf.digitalRead(BTN_DOWN);
+  bool lf = !pcf.digitalRead(BTN_LEFT);
+  bool rg = !pcf.digitalRead(BTN_RIGHT);
+  if (up && !upPrev && selIndex > 0)              { selIndex--; uiDirty = true; }
+  if (dn && !dnPrev && selIndex < pktCount - 1)   { selIndex++; uiDirty = true; }
+  if (rg && !rgPrev) { retune((freqIdx + 1) % NUM_FREQS); uiDirty = true; }
+  if (lf && !lfPrev && pktCount > 0) {
+    int idx = pktCount - 1 - selIndex;
+    if (idx >= 0) {
+      appendCsv(packets[idx]);
+      NeoFx::event(NeoFx::Event::Capture);
+    }
+  }
+  upPrev = up; dnPrev = dn; lfPrev = lf; rgPrev = rg;
+
+  if (isSelectShortTapped() && pktCount > 0) {
+    int idx = pktCount - 1 - selIndex;
+    if (idx >= 0) {
+      drawDetail(packets[idx]);
+      // Stay on detail screen until SELECT long-hold or LEFT save.
+      while (!isSelectHeldLong()) {
+        if (!pcf.digitalRead(BTN_LEFT)) {
+          appendCsv(packets[idx]);
+          NeoFx::event(NeoFx::Event::Capture);
+          delay(200);
+        }
+        NeoFx::tick();
+        delay(20);
+      }
+      drawShell();
+      drawHeader();
+      drawList();
+      uiDirty = false;
+    }
+  }
+
+  if (uiDirty) {
+    drawHeader();
+    drawList();
+    uiDirty = false;
+  }
+
+  if (isSelectHeldLong()) {
+    feature_exit_requested = true;
+  }
+
+  delay(15);
+}
+
+void exit() {
+  s_sw.disableReceive();
+  ELECHOUSE_cc1101.setSidle();
+}
+
+}  // namespace RfDecoder
