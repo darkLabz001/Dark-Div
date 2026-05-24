@@ -8869,6 +8869,9 @@ static bool fetchMessages() {
     snprintf(lastErr, sizeof(lastErr), "https begin failed");
     return false;
   }
+  // Force uncompressed body so our parser sees plain JSON, not gzip bytes.
+  https.addHeader("Accept-Encoding", "identity");
+  https.addHeader("Accept", "application/json");
   int code = https.GET();
   if (code != 200) {
     snprintf(lastErr, sizeof(lastErr), "GET %d %s", code,
@@ -8887,6 +8890,18 @@ static bool fetchMessages() {
   body = https.getString();
   https.end();
 
+  // Trim leading whitespace / BOM so a Cloudflare wrapper byte doesn't
+  // confuse the parser into thinking the input is empty.
+  while (body.length() > 0) {
+    char c = body.charAt(0);
+    if (c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '\xEF' ||
+        c == '\xBB' || c == '\xBF' || c == 0) {
+      body.remove(0, 1);
+    } else {
+      break;
+    }
+  }
+
   // Filter: keep only the four fields we render. v6 wants ~16 B + key length
   // per filter entry; 256 B is plenty.
   StaticJsonDocument<256> filter;
@@ -8899,12 +8914,19 @@ static bool fetchMessages() {
   DeserializationError err = deserializeJson(
       doc, body, DeserializationOption::Filter(filter));
   if (err) {
+    // Include a printable preview so we can see what the server actually sent.
+    char preview[32] = {0};
+    int n = (int)body.length();
+    if (n > 0) {
+      int take = n < 28 ? n : 28;
+      for (int i = 0; i < take; i++) {
+        char c = body.charAt(i);
+        preview[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+      }
+    }
     snprintf(lastErr, sizeof(lastErr),
-             "json:%s bodyLen=%u heap=%u psram=%u",
-             err.c_str(),
-             (unsigned)body.length(),
-             (unsigned)ESP.getFreeHeap(),
-             (unsigned)ESP.getFreePsram());
+             "json:%s len=%d [%s]",
+             err.c_str(), n, preview);
     return false;
   }
 
