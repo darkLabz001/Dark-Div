@@ -8867,13 +8867,31 @@ static bool fetchMessages() {
            (unsigned)(ESP.getFreeHeap() / 1024));
   drawErr();
 
+  // Diagnostic: also probe a raw TCP connect to port 443 before the heavy
+  // TLS handshake. If this fails we know it's network-level, not TLS.
+  {
+    WiFiClient probe;
+    probe.setTimeout(4);
+    uint32_t t0 = millis();
+    bool ok = probe.connect("darksec.uk", 443);
+    uint32_t dt = millis() - t0;
+    probe.stop();
+    if (!ok) {
+      snprintf(lastErr, sizeof(lastErr), "tcp 443 fail (%lums)", (unsigned long)dt);
+      drawErr();
+      return false;
+    }
+    snprintf(lastErr, sizeof(lastErr), "tls handshake... (tcp %lums)",
+             (unsigned long)dt);
+    drawErr();
+  }
+
   WiFiClientSecure cli;
   cli.setInsecure();
-  cli.setHandshakeTimeout(5);    // seconds — bail fast on a stuck TLS hello
   HTTPClient https;
   https.setUserAgent("Dark-Div-Chat");
   https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  https.setTimeout(5000);
+  https.setTimeout(10000);
   if (!https.begin(cli, url)) {
     snprintf(lastErr, sizeof(lastErr), "https begin failed");
     return false;
