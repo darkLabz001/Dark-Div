@@ -171,6 +171,15 @@ namespace TimeSync {
   void utcDateNow(char* out, size_t cap);        // "DD/MM/YY"
   uint32_t epoch();                              // seconds since 1970, 0 if unset
 }
+namespace ChatRoom {
+  // Live chat client for darksec.uk/chat. Polls /api/chat every 3s and shows
+  // a scrolling message list. Short SELECT tap opens the on-screen keyboard
+  // to compose; long SELECT hold exits. Reuses WiFi creds from WifiSetup /
+  // OtaGithub; persists the chosen handle in NVS namespace "chat".
+  void setup();
+  void loop();
+  void exit();
+}
 namespace NeoFx {
   // 4-LED WS2812 strip on GPIO 1. Driven by event() calls from features +
   // a background tick() in the main loop. Honors settings.neopixelEnabled.

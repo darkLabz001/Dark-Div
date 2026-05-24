@@ -98,12 +98,13 @@ static constexpr uint8_t OTHER_LAYER_IR   = 1;
 static constexpr uint8_t OTHER_LAYER_RFID = 2;
 static constexpr uint8_t OTHER_LAYER_GPS  = 3;
 
-const int other_NUM_SUBMENU_ITEMS = 4;
+const int other_NUM_SUBMENU_ITEMS = 5;
 static constexpr int OTHER_GRID_COLS = 2;
 const char *other_submenu_items[other_NUM_SUBMENU_ITEMS] = {
     "IR Remote",
     "RFID/NFC",
     "GPS",
+    "Chat",
     "Main Menu"};
 
 const int rfid_NUM_SUBMENU_ITEMS = 9;
@@ -197,6 +198,7 @@ const unsigned char *other_submenu_icons[other_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_led,
     bitmap_icon_rfid_chip,
     bitmap_icon_satellite,
+    bitmap_icon_wifi,
     bitmap_icon_go_back
 };
 
@@ -2768,6 +2770,23 @@ void handleOtherSubmenuButtons() {
                 updateActiveSubmenu();
                 submenu_initialized = false;
                 displaySubmenu();
+            } else if (current_submenu_index == 3) {
+                // Chat — direct feature (no nested layer).
+                in_sub_menu = true;
+                feature_active = true;
+                feature_exit_requested = false;
+                ChatRoom::setup();
+                while (!feature_exit_requested) {
+                    ChatRoom::loop();
+                }
+                ChatRoom::exit();
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
             }
         } else if (other_layer == OTHER_LAYER_IR) {
             if (current_submenu_index == ir_NUM_SUBMENU_ITEMS - 1) {
@@ -2987,6 +3006,23 @@ void handleOtherSubmenuButtons() {
                 updateActiveSubmenu();
                 submenu_initialized = false;
                 displaySubmenu();
+            } else if (current_submenu_index == 3) {
+                // Chat — direct feature (no nested layer).
+                in_sub_menu = true;
+                feature_active = true;
+                feature_exit_requested = false;
+                ChatRoom::setup();
+                while (!feature_exit_requested) {
+                    ChatRoom::loop();
+                }
+                ChatRoom::exit();
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
             }
         } else if (other_layer == OTHER_LAYER_IR) {
             if (current_submenu_index == ir_NUM_SUBMENU_ITEMS - 1) {

@@ -8610,3 +8610,430 @@ void exit() {
 
 }  // namespace WebDashboard
 
+/* ════════════════════════════════════════════════════════════════════════════
+   ChatRoom — REST client for https://darksec.uk/api/chat
+   GET  /api/chat[?after=N]   -> [{id, username, message, created_at}, ...]
+   POST /api/chat             body {"username":"...","message":"..."}
+   No auth; 2 s server-side send debounce.
+   ════════════════════════════════════════════════════════════════════════════ */
+namespace ChatRoom {
+
+static constexpr const char* API_GET   = "https://darksec.uk/api/chat";
+static constexpr const char* API_POST  = "https://darksec.uk/api/chat";
+static constexpr uint32_t    POLL_MS   = 3000;
+static constexpr int         MAX_MSGS  = 24;
+static constexpr int         MSG_BODY_MAX = 160;
+
+struct Msg {
+  int32_t id;
+  char    username[24];
+  char    body[MSG_BODY_MAX];
+  char    hhmm[6];     // "HH:MM"
+};
+
+static Msg      msgs[MAX_MSGS];
+static int      msgCount    = 0;
+static int      msgScroll   = 0;     // 0 = show latest
+static int32_t  lastId      = 0;
+static char     handle[24]  = {0};
+static bool     wifiUp      = false;
+static bool     uiDirty     = true;
+static uint32_t lastPollMs  = 0;
+static uint32_t lastSentMs  = 0;
+static char     lastErr[40] = {0};
+
+static const uint16_t CH_RED  = 0xE0E6;
+static const uint16_t CH_DIM  = 0x6020;
+static const uint16_t CH_GRN  = 0x07C0;
+static const uint16_t CH_MID  = 0x9085;
+
+// ── Persistence (handle) ────────────────────────────────────────────────────
+static void loadHandle() {
+  Preferences p;
+  if (!p.begin("chat", true)) { handle[0] = 0; return; }
+  String s = p.getString("user", "");
+  p.end();
+  strncpy(handle, s.c_str(), sizeof(handle) - 1);
+  handle[sizeof(handle) - 1] = 0;
+}
+static void saveHandle() {
+  Preferences p;
+  if (!p.begin("chat", false)) return;
+  p.putString("user", String(handle));
+  p.end();
+}
+
+// ── Drawing ─────────────────────────────────────────────────────────────────
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0, 240, CH_RED);
+  tft.drawFastHLine(0, 24, 240, CH_DIM);
+  tft.drawFastHLine(0, 296, 240, CH_DIM);
+  tft.drawFastHLine(0, 319, 240, CH_RED);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(CH_RED, TFT_BLACK);
+  tft.setCursor(70, 6);
+  tft.print("[ CHAT ]");
+  tft.setTextColor(CH_DIM, TFT_BLACK);
+  tft.setCursor(8, 301);
+  tft.print("tap SEL=compose  hold=back");
+}
+
+static void drawHeader() {
+  tft.fillRect(0, 28, 240, 18, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(wifiUp ? CH_GRN : CH_RED, TFT_BLACK);
+  tft.setCursor(8, 30);
+  tft.print(wifiUp ? "darksec.uk" : "OFFLINE");
+  tft.setTextColor(CH_MID, TFT_BLACK);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "<%s>", handle[0] ? handle : "anon");
+  int w = tft.textWidth(buf);
+  tft.setCursor(232 - w, 30);
+  tft.print(buf);
+}
+
+// One message line, may wrap to two visual rows.
+// Returns the number of TFT rows it consumed (1 or 2).
+static int drawMsg(int row, const Msg& m) {
+  const int Y0 = 50;
+  const int rowH = 14;
+  if (Y0 + row * rowH > 290) return 0;
+
+  // First line: [HH:MM] <user> message...
+  char line[120];
+  snprintf(line, sizeof(line), "[%s] <%s> %s",
+           m.hhmm, m.username, m.body);
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  // Determine if we need to wrap (TFT is 240 px wide).
+  int w = tft.textWidth(line);
+  if (w <= 232) {
+    tft.fillRect(0, Y0 + row * rowH, 240, rowH, TFT_BLACK);
+    tft.setTextColor(CH_RED, TFT_BLACK);
+    tft.setCursor(4, Y0 + row * rowH);
+    // Colorize: time = dim, user = red, body = white
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "[%s] <%s> ", m.hhmm, m.username);
+    tft.setTextColor(CH_DIM, TFT_BLACK);
+    tft.print(prefix);
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.print(m.body);
+    return 1;
+  }
+
+  // Wrap: header on line 1, body indented on line 2.
+  char head[48];
+  snprintf(head, sizeof(head), "[%s] <%s>", m.hhmm, m.username);
+  tft.fillRect(0, Y0 + row * rowH, 240, rowH, TFT_BLACK);
+  tft.setTextColor(CH_DIM, TFT_BLACK);
+  tft.setCursor(4, Y0 + row * rowH);
+  tft.print(head);
+
+  if (Y0 + (row + 1) * rowH > 290) return 1;
+  tft.fillRect(0, Y0 + (row + 1) * rowH, 240, rowH, TFT_BLACK);
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(12, Y0 + (row + 1) * rowH);
+  // Truncate body if still too wide on the second line.
+  char body[60];
+  strncpy(body, m.body, sizeof(body) - 1);
+  body[sizeof(body) - 1] = 0;
+  while (tft.textWidth(body) > 220 && strlen(body) > 4) body[strlen(body) - 1] = 0;
+  tft.print(body);
+  return 2;
+}
+
+static void drawMessages() {
+  tft.fillRect(0, 50, 240, 240, TFT_BLACK);
+  if (msgCount == 0) {
+    tft.setTextFont(2);
+    tft.setTextColor(CH_DIM, TFT_BLACK);
+    tft.setCursor(20, 140);
+    tft.print(wifiUp ? "// no messages yet //"
+                     : "// no wifi connection //");
+    if (!wifiUp) {
+      tft.setCursor(20, 160);
+      tft.print("Settings -> WiFi");
+    }
+    return;
+  }
+  // Draw newest-first from the bottom up, respecting wrap.
+  int row = 0;
+  int firstShown = msgCount - 1 - msgScroll;
+  if (firstShown < 0) firstShown = 0;
+  for (int i = firstShown; i >= 0 && row < 18; i--) {
+    int used = drawMsg(row, msgs[i]);
+    if (used == 0) break;
+    row += used;
+  }
+}
+
+static void drawErr() {
+  if (!lastErr[0]) return;
+  tft.fillRect(0, 282, 240, 14, TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(CH_RED, TFT_BLACK);
+  tft.setCursor(4, 284);
+  tft.print(lastErr);
+}
+
+// ── Networking ──────────────────────────────────────────────────────────────
+static bool ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) { wifiUp = true; return true; }
+  String ssid, pw;
+  if (!OtaGithub::_loadCreds(ssid, pw)) { wifiUp = false; return false; }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pw.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 8000) delay(150);
+  wifiUp = (WiFi.status() == WL_CONNECTED);
+  if (wifiUp) TimeSync::tryNtp(2500);
+  return wifiUp;
+}
+
+static void parseHhmm(const char* iso, char* out, size_t cap) {
+  // "2026-04-14 07:13:12" -> "07:13"
+  int hh, mm;
+  if (sscanf(iso, "%*d-%*d-%*d %d:%d", &hh, &mm) == 2) {
+    snprintf(out, cap, "%02d:%02d", hh, mm);
+  } else if (sscanf(iso, "%*d-%*d-%*dT%d:%d", &hh, &mm) == 2) {
+    snprintf(out, cap, "%02d:%02d", hh, mm);
+  } else {
+    snprintf(out, cap, "--:--");
+  }
+}
+
+static void pushMsg(int32_t id, const char* user, const char* body, const char* ts) {
+  if (msgCount == MAX_MSGS) {
+    for (int i = 0; i < MAX_MSGS - 1; i++) msgs[i] = msgs[i + 1];
+    msgCount--;
+  }
+  Msg& m = msgs[msgCount++];
+  m.id = id;
+  strncpy(m.username, user ? user : "?", sizeof(m.username) - 1);
+  m.username[sizeof(m.username) - 1] = 0;
+  strncpy(m.body, body ? body : "", sizeof(m.body) - 1);
+  m.body[sizeof(m.body) - 1] = 0;
+  parseHhmm(ts ? ts : "", m.hhmm, sizeof(m.hhmm));
+  if (id > lastId) lastId = id;
+}
+
+static bool fetchMessages() {
+  if (!ensureWifi()) { snprintf(lastErr, sizeof(lastErr), "wifi down"); return false; }
+  String url = API_GET;
+  if (lastId > 0) { url += "?after="; url += String((int)lastId); }
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  HTTPClient https;
+  https.setUserAgent("Dark-Div-Chat");
+  https.setTimeout(6000);
+  if (!https.begin(cli, url)) { snprintf(lastErr, sizeof(lastErr), "https begin"); return false; }
+  int code = https.GET();
+  if (code != 200) {
+    snprintf(lastErr, sizeof(lastErr), "GET %d", code);
+    https.end();
+    return false;
+  }
+  String body = https.getString();
+  https.end();
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) { snprintf(lastErr, sizeof(lastErr), "json %s", err.c_str()); return false; }
+  JsonArray arr = doc.as<JsonArray>();
+  bool added = false;
+  for (JsonObject m : arr) {
+    int32_t id = m["id"] | 0;
+    if (id <= lastId) continue;
+    pushMsg(id,
+            m["username"] | "?",
+            m["message"]  | "",
+            m["created_at"] | "");
+    added = true;
+  }
+  if (added) { msgScroll = 0; uiDirty = true; }
+  lastErr[0] = 0;
+  return true;
+}
+
+static bool postMessage(const char* text) {
+  if (!ensureWifi())   { snprintf(lastErr, sizeof(lastErr), "wifi down"); return false; }
+  if (!handle[0])      { snprintf(lastErr, sizeof(lastErr), "no handle"); return false; }
+
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  HTTPClient https;
+  https.setUserAgent("Dark-Div-Chat");
+  https.setTimeout(6000);
+  if (!https.begin(cli, API_POST)) { snprintf(lastErr, sizeof(lastErr), "https begin"); return false; }
+  https.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<512> doc;
+  doc["username"] = handle;
+  doc["message"]  = text;
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = https.POST(payload);
+  https.end();
+  if (code < 200 || code >= 300) {
+    snprintf(lastErr, sizeof(lastErr), "POST %d", code);
+    return false;
+  }
+  lastSentMs = millis();
+  lastErr[0] = 0;
+  // Pull our just-sent message back from the server.
+  fetchMessages();
+  return true;
+}
+
+// ── On-screen keyboard prompts ──────────────────────────────────────────────
+static const char* CHAT_KB_UP[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+static const char* CHAT_KB_LO[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+static const char* CHAT_KB_SH[] = {"UPPER", "lower"};
+
+static bool promptKb(const char* t1, const char* t2, String& out, int maxLen) {
+  OnScreenKeyboardConfig cfg = {};
+  cfg.titleLine1     = t1;
+  cfg.titleLine2     = t2;
+  cfg.rows           = CHAT_KB_UP;
+  cfg.rowCount       = 4;
+  cfg.maxLen         = maxLen;
+  cfg.shuffleNames   = CHAT_KB_SH;
+  cfg.shuffleCount   = 2;
+  cfg.buttonsY       = 280;
+  cfg.backLabel      = "Back";
+  cfg.middleLabel    = "Case";
+  cfg.okLabel        = "OK";
+  cfg.enableShuffle  = true;
+  cfg.requireNonEmpty = true;
+  cfg.emptyErrorMsg  = "Cannot be empty";
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, out);
+  if (r.accepted) { out = r.text; return true; }
+  return false;
+}
+
+static void promptHandleIfNeeded() {
+  if (handle[0]) return;
+  String s = "";
+  if (promptKb("Pick a handle", "Visible to everyone", s, 16)) {
+    // Strip < > to match the web client's sanitization.
+    s.replace("<", ""); s.replace(">", "");
+    s.trim();
+    strncpy(handle, s.c_str(), sizeof(handle) - 1);
+    handle[sizeof(handle) - 1] = 0;
+    if (handle[0]) saveHandle();
+  }
+}
+
+static void composeAndSend() {
+  if (!handle[0]) { promptHandleIfNeeded(); }
+  if (!handle[0]) return;
+  if ((uint32_t)(millis() - lastSentMs) < 2000) {
+    snprintf(lastErr, sizeof(lastErr), "slow down (2s)");
+    uiDirty = true;
+    return;
+  }
+  String s = "";
+  if (!promptKb("Message", handle, s, MSG_BODY_MAX - 1)) return;
+  s.trim();
+  if (s.length() == 0) return;
+  postMessage(s.c_str());
+  uiDirty = true;
+}
+
+// ── Setup / loop / exit ─────────────────────────────────────────────────────
+void setup() {
+  msgCount = 0; msgScroll = 0; lastId = 0; lastErr[0] = 0;
+  lastPollMs = 0; lastSentMs = 0;
+  uiDirty = true;
+
+  drawShell();
+  loadHandle();
+
+  tft.setTextFont(2); tft.setTextColor(CH_DIM, TFT_BLACK);
+  tft.setCursor(10, 80); tft.print("Connecting...");
+  ensureWifi();
+
+  drawShell();
+  drawHeader();
+  promptHandleIfNeeded();
+  drawShell();
+  drawHeader();
+  drawMessages();
+  drawErr();
+
+  fetchMessages();
+  lastPollMs = millis();
+  uiDirty = true;
+}
+
+void loop() {
+  NeoFx::tick();
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastPollMs) >= POLL_MS) {
+    lastPollMs = now;
+    fetchMessages();
+    uiDirty = true;
+  }
+
+  if (uiDirty) {
+    drawHeader();
+    drawMessages();
+    drawErr();
+    uiDirty = false;
+  }
+
+  // UP/DOWN scroll history (when there's more than fits).
+  static bool upPrev = false, downPrev = false;
+  bool up = isButtonPressed(BTN_UP);
+  bool dn = isButtonPressed(BTN_DOWN);
+  if (up && !upPrev && msgScroll < msgCount - 1) { msgScroll++; uiDirty = true; }
+  if (dn && !downPrev && msgScroll > 0)          { msgScroll--; uiDirty = true; }
+  upPrev = up; downPrev = dn;
+
+  // RIGHT: change handle.
+  if (!pcf.digitalRead(BTN_RIGHT)) {
+    String s = String(handle);
+    if (promptKb("Change handle", "", s, 16)) {
+      s.replace("<", ""); s.replace(">", "");
+      s.trim();
+      strncpy(handle, s.c_str(), sizeof(handle) - 1);
+      handle[sizeof(handle) - 1] = 0;
+      if (handle[0]) saveHandle();
+    }
+    drawShell();
+    drawHeader();
+    drawMessages();
+    drawErr();
+    delay(150);
+  }
+
+  // SELECT short tap = compose; long hold = exit (legacy raw fires on press
+  // for exit, but we want short tap → compose, so use the explicit helpers).
+  if (isSelectShortTapped()) {
+    composeAndSend();
+    drawShell();
+    drawHeader();
+    drawMessages();
+    drawErr();
+  }
+  if (isSelectHeldLong()) {
+    feature_exit_requested = true;
+  }
+
+  delay(20);
+}
+
+void exit() {
+  // Leave WiFi connected — other features can reuse it.
+}
+
+}  // namespace ChatRoom
+
