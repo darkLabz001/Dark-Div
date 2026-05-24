@@ -8748,7 +8748,7 @@ static int drawMsg(int row, const Msg& m) {
 }
 
 static void drawMessages() {
-  tft.fillRect(0, 50, 240, 240, TFT_BLACK);
+  tft.fillRect(0, 50, 240, 228, TFT_BLACK);
   if (msgCount == 0) {
     tft.setTextFont(2);
     tft.setTextColor(CH_DIM, TFT_BLACK);
@@ -8761,24 +8761,55 @@ static void drawMessages() {
     }
     return;
   }
-  // Draw newest-first from the bottom up, respecting wrap.
-  int row = 0;
-  int firstShown = msgCount - 1 - msgScroll;
-  if (firstShown < 0) firstShown = 0;
-  for (int i = firstShown; i >= 0 && row < 18; i--) {
-    int used = drawMsg(row, msgs[i]);
-    if (used == 0) break;
-    row += used;
+  // Render newest at the BOTTOM (proper chat orientation). Walk back from the
+  // newest entry, measure each message's row count, stop when we run out of
+  // vertical space, then paint them top-to-bottom.
+  constexpr int Y_TOP    = 50;
+  constexpr int Y_BOTTOM = 278;
+  constexpr int ROW_H    = 14;
+
+  int newest = msgCount - 1 - msgScroll;
+  if (newest < 0) newest = 0;
+
+  int picked[24];
+  int rowsUsed[24];
+  int pickedCount = 0;
+  int totalRows   = 0;
+  const int maxRows = (Y_BOTTOM - Y_TOP) / ROW_H;
+  for (int i = newest; i >= 0 && pickedCount < (int)(sizeof(picked)/sizeof(picked[0])); i--) {
+    char head[64];
+    snprintf(head, sizeof(head), "[%s] <%s> %s",
+             msgs[i].hhmm, msgs[i].username, msgs[i].body);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    int wrap = (tft.textWidth(head) > 232) ? 2 : 1;
+    if (totalRows + wrap > maxRows) break;
+    picked[pickedCount]   = i;
+    rowsUsed[pickedCount] = wrap;
+    totalRows += wrap;
+    pickedCount++;
+  }
+
+  // Paint oldest-of-the-picked first, top-aligned to whatever space remains
+  // (so the newest sits flush against Y_BOTTOM).
+  int y = Y_BOTTOM - totalRows * ROW_H;
+  for (int k = pickedCount - 1; k >= 0; k--) {
+    int idx = picked[k];
+    int row = (y - Y_TOP) / ROW_H;
+    drawMsg(row, msgs[idx]);
+    y += rowsUsed[k] * ROW_H;
   }
 }
 
 static void drawErr() {
+  tft.fillRect(0, 280, 240, 14, TFT_BLACK);
   if (!lastErr[0]) return;
-  tft.fillRect(0, 282, 240, 14, TFT_BLACK);
-  tft.setTextFont(1);
+  tft.setTextFont(2);
   tft.setTextSize(1);
-  tft.setTextColor(CH_RED, TFT_BLACK);
-  tft.setCursor(4, 284);
+  // Use green for the "ok: N seen / M new" status line, red for everything else.
+  bool isOk = (strncmp(lastErr, "ok:", 3) == 0);
+  tft.setTextColor(isOk ? CH_GRN : CH_RED, TFT_BLACK);
+  tft.setCursor(6, 281);
   tft.print(lastErr);
 }
 
@@ -8827,36 +8858,44 @@ static bool fetchMessages() {
   if (!ensureWifi()) { snprintf(lastErr, sizeof(lastErr), "wifi down"); return false; }
   String url = API_GET;
   if (lastId > 0) { url += "?after="; url += String((int)lastId); }
+
   WiFiClientSecure cli;
   cli.setInsecure();
   HTTPClient https;
   https.setUserAgent("Dark-Div-Chat");
-  https.setTimeout(6000);
-  if (!https.begin(cli, url)) { snprintf(lastErr, sizeof(lastErr), "https begin"); return false; }
+  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  https.setTimeout(8000);
+  if (!https.begin(cli, url)) {
+    snprintf(lastErr, sizeof(lastErr), "https begin failed");
+    return false;
+  }
   int code = https.GET();
   if (code != 200) {
-    snprintf(lastErr, sizeof(lastErr), "GET %d", code);
+    snprintf(lastErr, sizeof(lastErr), "GET %d %s", code,
+             code < 0 ? https.errorToString(code).c_str() : "");
     https.end();
     return false;
   }
-  String body = https.getString();
-  https.end();
 
-  // The server returns the full message history on the first call (no `after`).
-  // We don't need every field, so a Filter cuts the working set drastically.
-  // Even then, give the doc plenty of room — the live channel can have hundreds
-  // of small messages, and ArduinoJson v6 needs ~2x the JSON size unfiltered.
-  StaticJsonDocument<128> filter;
-  filter[0]["id"]         = true;
-  filter[0]["username"]   = true;
-  filter[0]["message"]    = true;
-  filter[0]["created_at"] = true;
-  DynamicJsonDocument doc(40 * 1024);
-  DeserializationError err =
-    deserializeJson(doc, body, DeserializationOption::Filter(filter));
-  if (err) { snprintf(lastErr, sizeof(lastErr), "json %s", err.c_str()); return false; }
+  // Stream straight into ArduinoJson — avoids holding the full body + the
+  // parsed doc at the same time, which the 9-10 KB initial fetch was tight on.
+  DynamicJsonDocument doc(48 * 1024);
+  WiFiClient* stream = https.getStreamPtr();
+  DeserializationError err = deserializeJson(doc, *stream);
+  https.end();
+  if (err) {
+    snprintf(lastErr, sizeof(lastErr), "json: %s", err.c_str());
+    return false;
+  }
+
+  if (!doc.is<JsonArray>()) {
+    snprintf(lastErr, sizeof(lastErr), "json: not array");
+    return false;
+  }
+
   JsonArray arr = doc.as<JsonArray>();
-  bool added = false;
+  int seen = arr.size();
+  int added = 0;
   for (JsonObject m : arr) {
     int32_t id = m["id"] | 0;
     if (id <= lastId) continue;
@@ -8864,10 +8903,11 @@ static bool fetchMessages() {
             m["username"] | "?",
             m["message"]  | "",
             m["created_at"] | "");
-    added = true;
+    added++;
   }
-  if (added) { msgScroll = 0; uiDirty = true; }
-  lastErr[0] = 0;
+  if (added > 0) { msgScroll = 0; uiDirty = true; }
+  snprintf(lastErr, sizeof(lastErr), "ok: %d seen / %d new", seen, added);
+  uiDirty = true;
   return true;
 }
 
