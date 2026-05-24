@@ -842,15 +842,23 @@ static bool sdTryBeginOrder() {
 
 bool isSDCardAvailable() {
 
+  // The SD_CD pin polarity varies between ESP32-DIV V2 batches (some have
+  // no CD switch at all — the pin floats). Don't trust it as a hard gate:
+  // refresh the status for the status-bar icon, but always fall through to
+  // the actual mount attempt below. If the mount succeeds, the card is
+  // physically there regardless of what CD says.
   #ifdef SD_CD
   updateSdCardStatus();
-  if (!sdCardPresent) return false;
   #endif
 
   static bool sdMounted = false;
   if (sdMounted) {
-
-    if (SD.exists("/")) return true;
+    if (SD.exists("/")) {
+      #ifdef SD_CD
+      sdCardPresent = true;     // sync the status-bar flag with reality
+      #endif
+      return true;
+    }
     sdMounted = false;
   }
 
@@ -866,6 +874,9 @@ bool isSDCardAvailable() {
 
   if (sdTryBeginOrder()) {
     sdMounted = true;
+    #ifdef SD_CD
+    sdCardPresent = true;
+    #endif
     return true;
   }
   return false;
