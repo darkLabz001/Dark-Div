@@ -8842,8 +8842,18 @@ static bool fetchMessages() {
   String body = https.getString();
   https.end();
 
-  DynamicJsonDocument doc(12288);
-  DeserializationError err = deserializeJson(doc, body);
+  // The server returns the full message history on the first call (no `after`).
+  // We don't need every field, so a Filter cuts the working set drastically.
+  // Even then, give the doc plenty of room — the live channel can have hundreds
+  // of small messages, and ArduinoJson v6 needs ~2x the JSON size unfiltered.
+  StaticJsonDocument<128> filter;
+  filter[0]["id"]         = true;
+  filter[0]["username"]   = true;
+  filter[0]["message"]    = true;
+  filter[0]["created_at"] = true;
+  DynamicJsonDocument doc(40 * 1024);
+  DeserializationError err =
+    deserializeJson(doc, body, DeserializationOption::Filter(filter));
   if (err) { snprintf(lastErr, sizeof(lastErr), "json %s", err.c_str()); return false; }
   JsonArray arr = doc.as<JsonArray>();
   bool added = false;
