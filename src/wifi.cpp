@@ -8854,17 +8854,26 @@ static void pushMsg(int32_t id, const char* user, const char* body, const char* 
   if (id > lastId) lastId = id;
 }
 
+static void drawErr();   // fwd
+
 static bool fetchMessages() {
   if (!ensureWifi()) { snprintf(lastErr, sizeof(lastErr), "wifi down"); return false; }
   String url = API_GET;
   if (lastId > 0) { url += "?after="; url += String((int)lastId); }
 
+  // Show a "fetching..." indicator immediately, so if the HTTPS handshake
+  // hangs the user can still tell we got this far.
+  snprintf(lastErr, sizeof(lastErr), "fetching... heap=%uk",
+           (unsigned)(ESP.getFreeHeap() / 1024));
+  drawErr();
+
   WiFiClientSecure cli;
   cli.setInsecure();
+  cli.setHandshakeTimeout(5);    // seconds — bail fast on a stuck TLS hello
   HTTPClient https;
   https.setUserAgent("Dark-Div-Chat");
   https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  https.setTimeout(8000);
+  https.setTimeout(5000);
   if (!https.begin(cli, url)) {
     snprintf(lastErr, sizeof(lastErr), "https begin failed");
     return false;
