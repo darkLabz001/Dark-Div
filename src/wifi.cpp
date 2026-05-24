@@ -8877,14 +8877,25 @@ static bool fetchMessages() {
     return false;
   }
 
-  // Stream straight into ArduinoJson — avoids holding the full body + the
-  // parsed doc at the same time, which the 9-10 KB initial fetch was tight on.
-  DynamicJsonDocument doc(48 * 1024);
+  // The internal SRAM heap gets fragmented; even with 100+ KB free total, a
+  // single contiguous 48 KB doc allocation fails ("NoMemory"). Route the doc
+  // to PSRAM (board has it; see [[esp32-div-flashing]]/platformio.ini).
+  struct PsramAlloc {
+    void* allocate(size_t size)      { return ps_malloc(size); }
+    void  deallocate(void* p)        { free(p); }
+    void* reallocate(void* p, size_t s) { return ps_realloc(p, s); }
+  };
+  using PsramJsonDoc = BasicJsonDocument<PsramAlloc>;
+
+  PsramJsonDoc doc(64 * 1024);
   WiFiClient* stream = https.getStreamPtr();
   DeserializationError err = deserializeJson(doc, *stream);
   https.end();
   if (err) {
-    snprintf(lastErr, sizeof(lastErr), "json: %s", err.c_str());
+    snprintf(lastErr, sizeof(lastErr), "json: %s heap=%u psram=%u",
+             err.c_str(),
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getFreePsram());
     return false;
   }
 
