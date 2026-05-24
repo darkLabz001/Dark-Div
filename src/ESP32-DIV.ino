@@ -340,6 +340,9 @@ bool isButtonPressed(int buttonPin) {
 }
 
 bool isSelectShortTapped() {
+  // Drive the state machine so callers don't have to remember to poll
+  // isButtonPressed(BTN_SELECT) on every loop iteration.
+  (void)isButtonPressed(BTN_SELECT);
   if (s_selectShortPending) {
     s_selectShortPending = false;
     return true;
@@ -348,10 +351,11 @@ bool isSelectShortTapped() {
 }
 
 bool isSelectHeldLong() {
+  (void)isButtonPressed(BTN_SELECT);
   // True once when the long-hold threshold is first crossed. Caller is
   // responsible for waiting for release if it cares about debounce.
   if (s_selectLongFired) {
-    // Latch a per-press one-shot by clearing the press-since marker — keeps
+    // Latch a per-press one-shot by snapshotting press-start — keeps
     // returning false until the next press/release cycle.
     static uint32_t lastFiredAtMs = 0;
     if (s_selectPressedSinceMs != 0 && s_selectPressedSinceMs != lastFiredAtMs) {
