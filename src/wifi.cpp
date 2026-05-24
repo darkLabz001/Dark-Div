@@ -8971,8 +8971,8 @@ static bool fetchMessages() {
   }
   if (added > 0) { msgScroll = 0; uiDirty = true; }
   snprintf(lastErr, sizeof(lastErr),
-           "ok: %d seen / %d new (heap=%uk)",
-           seen, added, (unsigned)(ESP.getFreeHeap() / 1024));
+           "ok seen=%d new=%d stored=%d lastId=%ld",
+           seen, added, msgCount, (long)lastId);
   uiDirty = true;
   return true;
 }
