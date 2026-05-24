@@ -171,6 +171,15 @@ namespace TimeSync {
   void utcDateNow(char* out, size_t cap);        // "DD/MM/YY"
   uint32_t epoch();                              // seconds since 1970, 0 if unset
 }
+namespace FlockFinder {
+  // BLE scan that flags devices matching the Flock Safety camera / Penguin
+  // battery signatures from JustCallMeKoko's ESP32Marauder firmware. See
+  // bluetooth.cpp for detection logic (OUI list + Xuntong mfg + Penguin
+  // name pattern). Logs hits to /captures/flock.csv.
+  void setup();
+  void loop();
+  void exit();
+}
 namespace ChatRoom {
   // Live chat client for darksec.uk/chat. Polls /api/chat every 3s and shows
   // a scrolling message list. Short SELECT tap opens the on-screen keyboard

@@ -61,7 +61,7 @@ const char *submenu_items[NUM_SUBMENU_ITEMS] = {
     "Pwn Mode",
     "Back to Main Menu"};
 
-const int bluetooth_NUM_SUBMENU_ITEMS = 7;
+const int bluetooth_NUM_SUBMENU_ITEMS = 8;
 const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Jammer",
     "BLE Spoofer",
@@ -69,6 +69,7 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "Sniffer",
     "BLE Scanner",
     "BLE Rubber Ducky",
+    "Flock Finder",
     "Back to Main Menu"};
 
 const int nrf_NUM_SUBMENU_ITEMS = 3;
@@ -169,6 +170,7 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_analyzer,
     bitmap_icon_graph,
     bitmap_icon_rubber_ducky,
+    bitmap_icon_eye2,        // Flock Finder
     bitmap_icon_go_back
 };
 
@@ -1245,13 +1247,38 @@ void handleBluetoothSubmenuButtons() {
         last_interaction_time = millis();
         delay(200);
 
-        if (current_submenu_index == 6) {
+        if (current_submenu_index == 7) {
             in_sub_menu = false;
             feature_active = false;
             feature_exit_requested = false;
             displayMenu();
             handleButtons();
             is_main_menu = false;
+        }
+
+        if (current_submenu_index == 6) {
+            // Flock Finder.
+            current_submenu_index = 6;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            FlockFinder::setup();
+            while (current_submenu_index == 6 && !feature_exit_requested) {
+                current_submenu_index = 6;
+                in_sub_menu = true;
+                FlockFinder::loop();
+            }
+            FlockFinder::exit();
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
+            }
+            return;
         }
 
         if (current_submenu_index == 0) {
@@ -1489,13 +1516,35 @@ void handleBluetoothSubmenuButtons() {
                 displaySubmenu();
                 delay(200);
 
-                if (current_submenu_index == 6) {
+                if (current_submenu_index == 7) {
                     in_sub_menu = false;
                     feature_active = false;
                     feature_exit_requested = false;
                     displayMenu();
                     handleButtons();
                     is_main_menu = false;
+                } else if (current_submenu_index == 6) {
+                    // Flock Finder.
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    FlockFinder::setup();
+                    while (current_submenu_index == 6 && !feature_exit_requested) {
+                        current_submenu_index = 6;
+                        in_sub_menu = true;
+                        FlockFinder::loop();
+                    }
+                    FlockFinder::exit();
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                    return;
                 } else if (current_submenu_index == 0) {
                     current_submenu_index = 0;
                     in_sub_menu = true;

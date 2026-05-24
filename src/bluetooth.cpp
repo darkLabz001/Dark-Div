@@ -3101,3 +3101,355 @@ void exit() {
   sniffer.stop();
 }
 }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   FlockFinder — Flock Safety ALPR camera detector (ported from JustCallMe-
+   Koko's ESP32Marauder). Two-signal BLE detection:
+     1) Source MAC OUI matches Marauder's curated list of 27 Flock OUIs.
+     2) Xuntong manufacturer data (company id 0x09C8) + a Penguin-style
+        device name ("Penguin-NNNNNNNNNN", "FS Ext Battery", 10-digit, or
+        empty name combined with the Xuntong mfg byte sequence).
+   Extracts the camera/battery serial when present ("TN" prefix + digits).
+   ════════════════════════════════════════════════════════════════════════════ */
+#include "gps.h"        // GpsWardriver::stopBackgroundIfRunning(), TimeSync
+
+namespace FlockFinder {
+
+// Curated OUI list from upstream Marauder. Hardware actually used in Flock
+// cameras + Penguin battery packs (Sierra Wireless modems, cellular modules).
+static const uint8_t kFlockOuis[][3] = {
+  {0x58, 0x8E, 0x81}, {0xCC, 0xCC, 0xCC}, {0xEC, 0x1B, 0xBD}, {0x90, 0x35, 0xEA},
+  {0x04, 0x0D, 0x84}, {0xF0, 0x82, 0xC0}, {0x1C, 0x34, 0xF1}, {0x38, 0x5B, 0x44},
+  {0x94, 0x34, 0x69}, {0xB4, 0xE3, 0xF9}, {0x70, 0xC9, 0x4E}, {0x3C, 0x91, 0x80},
+  {0xD8, 0xF3, 0xBC}, {0x80, 0x30, 0x49}, {0x14, 0x5A, 0xFC}, {0x74, 0x4C, 0xA1},
+  {0x08, 0x3A, 0x88}, {0x9C, 0x2F, 0x9D}, {0x94, 0x08, 0x53}, {0xE4, 0xAA, 0xEA},
+  {0xF4, 0x6A, 0xDD}, {0xF8, 0xA2, 0xD6}, {0xE0, 0x0A, 0xF6}, {0x00, 0xF4, 0x8D},
+  {0xD0, 0x39, 0x57}, {0xE8, 0xD0, 0xFC}, {0xB4, 0x1E, 0x52},
+};
+static constexpr size_t kFlockOuiCount = sizeof(kFlockOuis) / sizeof(kFlockOuis[0]);
+
+static constexpr uint16_t XUNTONG_COMPANY_ID = 0x09C8;   // little-endian: C8 09
+
+struct FlockHit {
+  uint8_t  mac[6];
+  char     name[20];
+  char     serial[20];
+  int8_t   rssi;
+  uint8_t  reason;        // 1 = OUI, 2 = Xuntong+name, 3 = both
+  uint32_t firstSeenMs;
+  uint32_t lastSeenMs;
+};
+
+static constexpr int MAX_HITS = 32;
+static FlockHit hits[MAX_HITS];
+static int      hitCount    = 0;
+static int      selIndex    = 0;
+static int      scroll      = 0;
+static bool     uiDirty     = true;
+static bool     scanRunning = false;
+static uint32_t scanStartMs = 0;
+static uint32_t advCount    = 0;
+static uint32_t lastScanMs  = 0;
+static bool     loggedThisSession[MAX_HITS] = {false};
+
+static const uint16_t F_RED = 0xE0E6;
+static const uint16_t F_DIM = 0x6020;
+static const uint16_t F_GRN = 0x07C0;
+
+// --- Detection helpers ------------------------------------------------------
+static bool ouiMatches(const uint8_t mac[6]) {
+  for (size_t i = 0; i < kFlockOuiCount; i++) {
+    if (memcmp(mac, kFlockOuis[i], 3) == 0) return true;
+  }
+  return false;
+}
+
+static bool isPenguinName(const String& name) {
+  if (name.length() == 0) return false;
+  if (name == "FS Ext Battery") return true;
+  // "Penguin-DDDDDDDDDD"
+  if (name.startsWith("Penguin-") && name.length() == 18) {
+    for (size_t i = 8; i < name.length(); i++) {
+      char c = name.charAt(i);
+      if (c < '0' || c > '9') return false;
+    }
+    return true;
+  }
+  // 10 digits only (Xuntong-side name fallback)
+  if (name.length() == 10) {
+    for (size_t i = 0; i < name.length(); i++) {
+      char c = name.charAt(i);
+      if (c < '0' || c > '9') return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+// Mfg-data string from NimBLE is `[CompanyID-LE(2)] [vendor bytes...]`.
+// Returns true if company id is Xuntong AND (name is Penguin-style or empty).
+static bool xuntongMatches(const std::string& mfg, const String& name) {
+  if (mfg.size() < 2) return false;
+  uint16_t cid = (uint8_t)mfg[0] | ((uint16_t)(uint8_t)mfg[1] << 8);
+  if (cid != XUNTONG_COMPANY_ID) return false;
+  return isPenguinName(name) || name.length() == 0;
+}
+
+// Scan the vendor bytes for "TN" + digits to extract a serial.
+static void extractSerial(const std::string& mfg, char* out, size_t cap) {
+  out[0] = 0;
+  if (mfg.size() < 4) return;
+  // mfg = [CID(2)] [vendor...]. Start scanning at offset 2.
+  bool started = false;
+  size_t w = 0;
+  for (size_t k = 2; k < mfg.size() && w + 1 < cap; k++) {
+    char c = (char)mfg[k];
+    if (!started) {
+      if (c == 'T' && (k + 1) < mfg.size() && (char)mfg[k + 1] == 'N') {
+        out[w++] = 'T'; out[w++] = 'N';
+        started = true;
+        k++;
+      }
+    } else {
+      if (c >= '0' && c <= '9') {
+        out[w++] = c;
+      } else if (c == ' ' || c == '#' || c == '-') {
+        continue;
+      } else {
+        break;
+      }
+    }
+  }
+  out[w] = 0;
+}
+
+static int findOrAlloc(const uint8_t mac[6]) {
+  for (int i = 0; i < hitCount; i++) {
+    if (memcmp(hits[i].mac, mac, 6) == 0) return i;
+  }
+  if (hitCount >= MAX_HITS) {
+    // Evict oldest.
+    int oldest = 0;
+    for (int i = 1; i < MAX_HITS; i++)
+      if (hits[i].lastSeenMs < hits[oldest].lastSeenMs) oldest = i;
+    return oldest;
+  }
+  return hitCount++;
+}
+
+// --- SD log -----------------------------------------------------------------
+static void appendCsv(const FlockHit& h) {
+  if (!(SD.cardSize() > 0)) return;
+  if (!SD.exists("/captures")) SD.mkdir("/captures");
+  bool fresh = !SD.exists("/captures/flock.csv");
+  File f = SD.open("/captures/flock.csv", FILE_APPEND);
+  if (!f) return;
+  if (fresh) {
+    f.println("utc,date,mac,name,serial,rssi,reason,lat,lon,fix");
+  }
+  char macS[18];
+  snprintf(macS, sizeof(macS), "%02X:%02X:%02X:%02X:%02X:%02X",
+           h.mac[0], h.mac[1], h.mac[2], h.mac[3], h.mac[4], h.mac[5]);
+  char utc[10], date[10];
+  TimeSync::utcNow(utc, sizeof(utc));
+  TimeSync::utcDateNow(date, sizeof(date));
+  // GPS not active in this mode; lat/lon left blank (Wardriver/Pwn provide
+  // their own GPS-tagged logging — keep this CSV simple).
+  f.printf("%s,%s,%s,%s,%s,%d,%u,,,0\n",
+           utc, date, macS,
+           h.name[0]   ? h.name   : "",
+           h.serial[0] ? h.serial : "",
+           (int)h.rssi, (unsigned)h.reason);
+  f.close();
+}
+
+// --- BLE callback -----------------------------------------------------------
+class FlockCallbacks : public BLEAdvertisedDeviceCallbacks {
+public:
+  void onResult(BLEAdvertisedDevice* dev) override {
+    advCount++;
+    uint8_t mac[6];
+    memcpy(mac, dev->getAddress().getNative(), 6);
+
+    bool ouiHit = ouiMatches(mac);
+    String name = dev->getName().c_str();
+    std::string mfg = dev->getManufacturerData();
+    bool xunHit = xuntongMatches(mfg, name);
+
+    if (!ouiHit && !xunHit) return;
+
+    int idx = findOrAlloc(mac);
+    FlockHit& h = hits[idx];
+    bool newSlot = (idx >= hitCount - 1) || (h.firstSeenMs == 0);
+    memcpy(h.mac, mac, 6);
+    strncpy(h.name, name.c_str(), sizeof(h.name) - 1);
+    h.name[sizeof(h.name) - 1] = 0;
+    extractSerial(mfg, h.serial, sizeof(h.serial));
+    h.rssi = (int8_t)dev->getRSSI();
+    h.reason = (uint8_t)((ouiHit ? 1 : 0) | (xunHit ? 2 : 0));
+    if (h.firstSeenMs == 0) h.firstSeenMs = millis();
+    h.lastSeenMs = millis();
+
+    if (newSlot && !loggedThisSession[idx]) {
+      loggedThisSession[idx] = true;
+      appendCsv(h);
+      NeoFx::event(NeoFx::Event::Capture);
+    }
+    uiDirty = true;
+  }
+};
+static FlockCallbacks s_cbs;
+static BLEScan* s_scan = nullptr;
+
+// --- UI ---------------------------------------------------------------------
+static void drawShell() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastHLine(0, 0, 240, F_RED);
+  tft.drawFastHLine(0, 24, 240, F_DIM);
+  tft.drawFastHLine(0, 296, 240, F_DIM);
+  tft.drawFastHLine(0, 319, 240, F_RED);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(F_RED, TFT_BLACK);
+  tft.setCursor(48, 6); tft.print("[ FLOCK FINDER ]");
+  tft.setTextColor(F_DIM, TFT_BLACK);
+  tft.setCursor(8, 301); tft.print("UP/DN  RIGHT=rescan  hold=back");
+}
+
+static const char* reasonStr(uint8_t r) {
+  switch (r) {
+    case 1: return "OUI";
+    case 2: return "XUN";
+    case 3: return "BOTH";
+    default: return "?";
+  }
+}
+
+static void drawList() {
+  tft.fillRect(0, 30, 240, 264, TFT_BLACK);
+  tft.setTextFont(2); tft.setTextSize(1);
+  tft.setTextColor(F_DIM, TFT_BLACK);
+  tft.setCursor(8, 32);
+  char head[64];
+  uint32_t up = (millis() - scanStartMs) / 1000;
+  snprintf(head, sizeof(head), "hits:%d  adv:%lu  up:%lus",
+           hitCount, (unsigned long)advCount, (unsigned long)up);
+  tft.print(head);
+
+  if (hitCount == 0) {
+    tft.setTextColor(F_DIM, TFT_BLACK);
+    tft.setCursor(20, 140);
+    tft.print(scanRunning ? "// scanning... //"
+                          : "// no hits yet //");
+    return;
+  }
+
+  // Sort newest-first by lastSeenMs into a working index list.
+  int order[MAX_HITS];
+  for (int i = 0; i < hitCount; i++) order[i] = i;
+  for (int i = 0; i + 1 < hitCount; i++) {
+    for (int j = i + 1; j < hitCount; j++) {
+      if (hits[order[j]].lastSeenMs > hits[order[i]].lastSeenMs) {
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+      }
+    }
+  }
+
+  const int Y0 = 54;
+  const int rowH = 22;
+  const int maxRows = (290 - Y0) / rowH;
+  int start = scroll;
+  if (start > hitCount - maxRows) start = hitCount - maxRows;
+  if (start < 0) start = 0;
+  for (int r = 0; r < maxRows && (start + r) < hitCount; r++) {
+    int idx = order[start + r];
+    const FlockHit& h = hits[idx];
+    int y = Y0 + r * rowH;
+    bool isSel = ((start + r) == selIndex);
+    if (isSel) tft.fillRect(2, y - 2, 236, rowH, F_DIM);
+    tft.setTextColor(isSel ? WHITE : F_RED, isSel ? F_DIM : TFT_BLACK);
+    tft.setCursor(4, y);
+    char macS[18];
+    snprintf(macS, sizeof(macS), "%02X:%02X:%02X:%02X:%02X:%02X",
+             h.mac[0], h.mac[1], h.mac[2], h.mac[3], h.mac[4], h.mac[5]);
+    tft.print(macS);
+    char extra[40];
+    snprintf(extra, sizeof(extra), " %ddBm %s",
+             (int)h.rssi, reasonStr(h.reason));
+    tft.print(extra);
+    tft.setCursor(4, y + 10);
+    tft.setTextColor(isSel ? WHITE : F_GRN, isSel ? F_DIM : TFT_BLACK);
+    char line2[40];
+    snprintf(line2, sizeof(line2), " %s %s",
+             h.serial[0] ? h.serial : "(no SN)",
+             h.name[0]   ? h.name   : "");
+    tft.print(line2);
+  }
+}
+
+// --- Setup / loop / exit ----------------------------------------------------
+void setup() {
+  hitCount = 0; advCount = 0; selIndex = 0; scroll = 0; uiDirty = true;
+  memset(hits, 0, sizeof(hits));
+  memset(loggedThisSession, 0, sizeof(loggedThisSession));
+
+  GpsWardriver::stopBackgroundIfRunning();
+
+  drawShell();
+  scanStartMs = millis();
+  NeoFx::event(NeoFx::Event::BootSplash);
+
+  BLEDevice::init("");
+  s_scan = BLEDevice::getScan();
+  s_scan->setAdvertisedDeviceCallbacks(&s_cbs, /*wantDuplicates=*/true);
+  s_scan->setActiveScan(true);
+  s_scan->setInterval(100);
+  s_scan->setWindow(99);
+  s_scan->start(0, nullptr, false);   // continuous scan in the background
+  scanRunning = true;
+  lastScanMs = millis();
+  drawList();
+}
+
+void loop() {
+  NeoFx::tick();
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastScanMs) > 400) {
+    lastScanMs = now;
+    if (uiDirty) { drawList(); uiDirty = false; }
+  }
+
+  // UP/DOWN scroll the hit list.
+  static bool upPrev = false, dnPrev = false, rgPrev = false;
+  bool up = !pcf.digitalRead(BTN_UP);
+  bool dn = !pcf.digitalRead(BTN_DOWN);
+  bool rg = !pcf.digitalRead(BTN_RIGHT);
+  if (up && !upPrev && selIndex > 0) { selIndex--; uiDirty = true; }
+  if (dn && !dnPrev && selIndex < hitCount - 1) { selIndex++; uiDirty = true; }
+  if (rg && !rgPrev) {
+    // Rescan = clear list and restart scan window.
+    hitCount = 0; advCount = 0; selIndex = 0; scroll = 0;
+    memset(hits, 0, sizeof(hits));
+    memset(loggedThisSession, 0, sizeof(loggedThisSession));
+    if (s_scan) { s_scan->stop(); s_scan->start(0, nullptr, false); }
+    scanStartMs = millis();
+    uiDirty = true;
+    delay(150);
+  }
+  upPrev = up; dnPrev = dn; rgPrev = rg;
+
+  if (isButtonPressed(BTN_SELECT)) {
+    feature_exit_requested = true;
+  }
+  delay(15);
+}
+
+void exit() {
+  if (s_scan) {
+    s_scan->stop();
+    s_scan->setAdvertisedDeviceCallbacks(nullptr);
+  }
+  scanRunning = false;
+}
+
+}  // namespace FlockFinder
+
