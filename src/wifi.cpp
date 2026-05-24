@@ -8998,13 +8998,17 @@ static bool postMessage(const char* text) {
   int code = https.POST(payload);
   https.end();
   if (code < 200 || code >= 300) {
-    snprintf(lastErr, sizeof(lastErr), "POST %d", code);
+    snprintf(lastErr, sizeof(lastErr), "POST %d %s", code,
+             code < 0 ? https.errorToString(code).c_str() : "");
     return false;
   }
   lastSentMs = millis();
-  lastErr[0] = 0;
-  // Pull our just-sent message back from the server.
-  fetchMessages();
+  // Don't fetch right away — a second back-to-back TLS handshake to the
+  // same host often fails on WiFiClientSecure ("connection refused"). Just
+  // force the regular 3-second poller to fire immediately on the next loop
+  // iteration, which will use a fresh socket and pull our new message in.
+  lastPollMs = millis() - POLL_MS - 1;
+  snprintf(lastErr, sizeof(lastErr), "sent (will refresh)");
   return true;
 }
 
